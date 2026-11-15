@@ -40,6 +40,22 @@ THUMB_W, THUMB_H = 120, 165
 KIND_LABEL = {"life": "Life", "mana": "Mana", "quicksilver": "Quicksilver"}
 
 
+MODIFIER_KEYSYMS = ("Shift_L", "Shift_R", "Control_L", "Control_R", "Alt_L", "Alt_R", "Meta_L", "Meta_R",
+                    "Caps_Lock", "Win_L", "Win_R", "Super_L", "Super_R")
+
+
+def combo_from_event(e) -> str:
+    """A Tk key event -> 'shift+q' style combination."""
+    import sys as _sys
+    win = _sys.platform == "win32"
+    name = core.vk_to_name(e.keycode) if win else None
+    if not name:
+        name = e.keysym.lower()
+    alt_mask = 0x20000 if win else 0x8
+    mods = [m for m, bit in (("ctrl", 0x4), ("alt", alt_mask), ("shift", 0x1)) if e.state & bit]
+    return "+".join(mods + [name])
+
+
 def to_photo(bgr: np.ndarray, max_w: int, max_h: int, upscale=True) -> tk.PhotoImage:
     """OpenCV image -> Tk image. Uses Tk's own PNG support, so no extra
     imaging library is needed (that library caused the old start-up crash)."""
@@ -116,6 +132,8 @@ class Engine:
         self.error: Optional[str] = None
         self.hotkeys = None
         self.reader: Optional[core.FlaskReader] = None
+        self.trig_values: Dict[int, Optional[float]] = {}
+        self.trig_crops: Dict[int, np.ndarray] = {}
         self.poll_interval = core.POLL_INTERVAL
 
     def log(self, msg: str) -> None:
@@ -130,6 +148,8 @@ class Engine:
         with self.lock:
             self.latest = r
             self.crops = {k: c.copy() for k, (c, _) in reader.last_crops.items()} if r else {}
+            self.trig_values = dict(reader.trigger_values)
+            self.trig_crops = {k: c.copy() for k, c in reader.trigger_crops.items()}
         return r
 
     def start(self, mode: str) -> None:
@@ -167,7 +187,9 @@ class Engine:
             if getattr(sender, "fallback_reason", ""):
                 self.log(f"Key sending: using the fallback method ({sender.fallback_reason}).")
             self.controller = core.FlaskController(
-                lambda: self._read_and_store(reader), sender, log=self.log, settings=settings)
+                lambda: self._read_and_store(reader), sender, log=self.log, settings=settings,
+                triggers=[t for t in cfg.get("triggers", []) if t["id"] in reader.trigger_models],
+                read_triggers=lambda: reader.trigger_values, press_key=sender.press_combo)
             self.controller.on_town = lambda on: self.log_q.put("__TOWN_ON__" if on else "__TOWN_OFF__")
             target = self._run_loop
             args = ()
@@ -219,6 +241,8 @@ class Engine:
         with self.lock:
             self.latest = None
             self.crops = {}
+            self.trig_values = {}
+            self.trig_crops = {}
 
 
 # ================================================================ flask card
@@ -748,6 +772,348 @@ class ReviewDialog(tk.Toplevel):
         self.destroy()
 
 
+# ================================================================ triggers
+class TriggerEditDialog(tk.Toplevel):
+    """Every setting for one trigger."""
+
+    def __init__(self, parent, trig: dict, is_new: bool):
+        super().__init__(parent, bg=BG)
+        self.title(f"{core.APP} | Trigger")
+        self.transient(parent)
+        self.grab_set()
+        self.resizable(False, False)
+        self.t = dict(trig)
+        self.result = None          # dict, or "delete"
+        tk.Label(self, text="New trigger" if is_new else "Edit trigger", bg=BG, fg=GOLD,
+                 font=TITLE_FONT).pack(anchor="w", padx=20, pady=(16, 0))
+        tk.Label(self, text="When the colour you pick in its box disappears, this presses a key.",
+                 bg=BG, fg=MUTED, font=FONT).pack(anchor="w", padx=20)
+        f = tk.Frame(self, bg=PANEL, highlightthickness=1, highlightbackground=BORDER)
+        f.pack(fill="x", padx=20, pady=12)
+        self.vars = {}
+
+        def row(label, help_=""):
+            r = tk.Frame(f, bg=PANEL)
+            r.pack(fill="x", padx=12, pady=4)
+            tk.Label(r, text=label, bg=PANEL, fg=TEXT, font=FONT, width=30, anchor="w").pack(side="left")
+            return r
+
+        def entry(r, key, width=7):
+            v = tk.StringVar(value=str(self.t[key]))
+            tk.Entry(r, textvariable=v, width=width, bg=PANEL_2, fg=TEXT, insertbackground=TEXT, relief="flat",
+                     font=FONT, justify="right" if width < 10 else "left", highlightthickness=1,
+                     highlightbackground=BORDER, highlightcolor=GOLD).pack(side="left", ipady=2)
+            self.vars[key] = v
+
+        entry(row("Name"), "name", width=24)
+        r = row("Key to press")
+        self.key_val = self.t["key"]
+        self.key_lbl = tk.Label(r, text=core.hotkey_label(self.key_val), bg=PANEL_2, fg=TEXT,
+                                font=("Segoe UI Semibold", 10), width=16, pady=3)
+        self.key_lbl.pack(side="left")
+        button(r, "Change", self._record, font=SMALL, pady=3).pack(side="left", padx=8)
+        self._recording = False
+        self.bind("<KeyPress>", self._on_key)
+        r = row("Start pressing when below (%)", )
+        entry(r, "fire_below")
+        tk.Label(r, text="of the colour still showing", bg=PANEL, fg=MUTED, font=SMALL).pack(side="left", padx=8)
+        r = row("Stop when back above (%)")
+        entry(r, "rearm_above")
+        tk.Label(r, text="re-arms for the next time", bg=PANEL, fg=MUTED, font=SMALL).pack(side="left", padx=8)
+        r = row("Keep pressing until it's back")
+        self.repeat = tk.BooleanVar(value=bool(self.t.get("repeat", True)))
+        tk.Checkbutton(r, variable=self.repeat, bg=PANEL, selectcolor=PANEL_2, activebackground=PANEL,
+                       highlightthickness=0).pack(side="left")
+        tk.Label(r, text="(off = press once each time)", bg=PANEL, fg=MUTED, font=SMALL).pack(side="left")
+        r = row("Repeat every - min (ms)")
+        entry(r, "repeat_min_ms")
+        r = row("Repeat every - max (ms)")
+        entry(r, "repeat_max_ms")
+        tk.Label(r, text="random in this range", bg=PANEL, fg=MUTED, font=SMALL).pack(side="left", padx=8)
+        r = row("Enabled")
+        self.enabled = tk.BooleanVar(value=bool(self.t.get("enabled", True)))
+        tk.Checkbutton(r, variable=self.enabled, bg=PANEL, selectcolor=PANEL_2, activebackground=PANEL,
+                       highlightthickness=0).pack(side="left")
+        tk.Label(f, text="The first press waits the normal press delay; key hold time is the same as the flasks'.",
+                 bg=PANEL, fg=MUTED, font=SMALL).pack(anchor="w", padx=12, pady=(2, 10))
+
+        self.err = tk.Label(self, text="", bg=BG, fg=RED, font=FONT, justify="left")
+        self.err.pack(anchor="w", padx=20)
+        bar = tk.Frame(self, bg=BG)
+        bar.pack(fill="x", padx=20, pady=(4, 16))
+        if not is_new:
+            button(bar, "Delete trigger", self._delete, kind="ghost").pack(side="left")
+        button(bar, "Save", self._save, kind="primary").pack(side="right")
+        button(bar, "Cancel", self.destroy).pack(side="right", padx=8)
+
+    def _record(self):
+        self._recording = True
+        self.key_lbl.config(text="Press keys… (Esc cancels)", bg=GOLD, fg="#1a140c")
+        self.focus_set()
+
+    def _on_key(self, e):
+        if not self._recording or e.keysym in MODIFIER_KEYSYMS:
+            return
+        self._recording = False
+        if e.keysym != "Escape":
+            self.key_val = combo_from_event(e)
+        self.key_lbl.config(text=core.hotkey_label(self.key_val), bg=PANEL_2, fg=TEXT)
+        return "break"
+
+    def _delete(self):
+        if messagebox.askyesno(core.APP, f"Delete the trigger “{self.t['name']}”?", parent=self):
+            self.result = "delete"
+            self.destroy()
+
+    def _save(self):
+        t = dict(self.t)
+        t["name"] = self.vars["name"].get().strip()
+        t["key"] = core.normalize_hotkey(self.key_val)
+        try:
+            for k in ("fire_below", "rearm_above", "repeat_min_ms", "repeat_max_ms"):
+                t[k] = int(self.vars[k].get().strip())
+        except ValueError:
+            self.err.config(text="Use whole numbers for the percentages and times.")
+            return
+        t["repeat"] = bool(self.repeat.get())
+        t["enabled"] = bool(self.enabled.get())
+        errs = core.validate_trigger(t)
+        if errs:
+            self.err.config(text="\n".join(errs))
+            return
+        self.result = t
+        self.destroy()
+
+
+class TriggerCalibDialog(tk.Toplevel):
+    """Draw a box around the area to watch, then click the colour (with the Similarity slider)."""
+
+    def __init__(self, parent, img: np.ndarray, trig: dict):
+        super().__init__(parent, bg=BG)
+        self.title(f"{core.APP} | {trig['name']}")
+        self.transient(parent)
+        self.grab_set()
+        self.img, self.t = img, trig
+        self.result = None
+        self.step = "box"
+        self.box = trig.get("box") if trig.get("box") and self._fits(trig["box"]) else None
+        self.points: List[Tuple[int, int]] = []
+        self.sim = int(trig.get("similarity", core.DEFAULT_SIMILARITY))
+        self.mode = trig.get("pick_mode", "shape")
+        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+        self.max_w, self.max_h = min(1280, sw - 120), min(600, sh - 320)
+        top = tk.Frame(self, bg=BG)
+        top.pack(fill="x", padx=16, pady=(14, 6))
+        self.step_lbl = tk.Label(top, text="", bg=BG, fg=GOLD, font=H_FONT)
+        self.step_lbl.pack(anchor="w")
+        self.instr = tk.Label(top, text="", bg=BG, fg=TEXT, font=("Segoe UI", 12), justify="left", wraplength=760)
+        self.instr.pack(anchor="w")
+        self.canvas = tk.Canvas(self, bg="#0c0a08", highlightthickness=0, cursor="crosshair")
+        self.canvas.pack(padx=16, pady=6)
+        self.canvas.bind("<ButtonPress-1>", self._down)
+        self.canvas.bind("<B1-Motion>", self._drag)
+        self.canvas.bind("<ButtonRelease-1>", self._up)
+        self.ctrl = tk.Frame(self, bg=PANEL, highlightthickness=1, highlightbackground=BORDER)
+        r1 = tk.Frame(self.ctrl, bg=PANEL)
+        r1.pack(fill="x", padx=12, pady=(8, 2))
+        tk.Label(r1, text="Similarity", bg=PANEL, fg=GOLD, font=H_FONT, width=10, anchor="w").pack(side="left")
+        tk.Label(r1, text="strict", bg=PANEL, fg=MUTED, font=SMALL).pack(side="left")
+        self.slider = ttk.Scale(r1, from_=1, to=100, orient="horizontal", length=340,
+                                style="Gold.Horizontal.TScale", command=self._slid)
+        self.slider.pack(side="left", padx=8, pady=4)
+        tk.Label(r1, text="loose", bg=PANEL, fg=MUTED, font=SMALL).pack(side="left")
+        self.sim_lbl = tk.Label(r1, text="", bg=PANEL, fg=TEXT, font=H_FONT, width=4)
+        self.sim_lbl.pack(side="left", padx=(10, 0))
+        r2 = tk.Frame(self.ctrl, bg=PANEL)
+        r2.pack(fill="x", padx=12, pady=(2, 8))
+        tk.Label(r2, text="Pick from", bg=PANEL, fg=GOLD, font=H_FONT, width=10, anchor="w").pack(side="left")
+        self.mode_var = tk.StringVar(value=self.mode)
+        for val, label in (("shape", "Inside the shape"), ("box", "Anywhere in box")):
+            tk.Radiobutton(r2, text=label, value=val, variable=self.mode_var, bg=PANEL, fg=TEXT, selectcolor=PANEL_2,
+                           activebackground=PANEL, activeforeground=TEXT, font=FONT, highlightthickness=0,
+                           command=self._render).pack(side="left", padx=(0, 14))
+        self.undo = button(r2, "Undo click", self._undo, kind="ghost", font=SMALL, pady=3)
+        self.undo.pack(side="right")
+        bar = tk.Frame(self, bg=BG)
+        bar.pack(fill="x", padx=16, pady=(4, 14), side="bottom")
+        button(bar, "Cancel", self.destroy, kind="ghost").pack(side="left")
+        self.back = button(bar, "◀  Back", self._back)
+        self.back.pack(side="left", padx=8)
+        self.next_btn = button(bar, "Next  ▶", self._next, kind="primary")
+        self.next_btn.pack(side="right")
+        st = ttk.Style(self)
+        st.configure("Gold.Horizontal.TScale", troughcolor=PANEL_2, background=GOLD, bordercolor=BORDER,
+                     lightcolor=GOLD, darkcolor="#a8853f", sliderthickness=18)
+        self._drag0 = None
+        self._render()
+
+    def _fits(self, b):
+        x, y, w, h = b
+        return x >= 0 and y >= 0 and x + w <= self.img.shape[1] and y + h <= self.img.shape[0]
+
+    def _show(self, region, overlay=None):
+        x, y, w, h = region
+        crop = self.img[y:y + h, x:x + w].copy()
+        if overlay is not None and overlay.any():
+            crop[overlay] = (crop[overlay] * 0.35 + np.array([255, 0, 255]) * 0.65).astype(np.uint8)
+        self.view = region
+        self.scale = min(self.max_w / w, self.max_h / h, 6.0)
+        self._photo = to_photo(crop, int(w * self.scale), int(h * self.scale))
+        self.canvas.config(width=self._photo.width(), height=self._photo.height())
+        self.canvas.delete("all")
+        self.canvas.create_image(0, 0, image=self._photo, anchor="nw")
+
+    def _to_img(self, cx, cy):
+        return int(self.view[0] + cx / self.scale), int(self.view[1] + cy / self.scale)
+
+    def _sel(self):
+        x, y, w, h = self.box
+        return core.liquid_selection(self.img[y:y + h, x:x + w], [(px - x, py - y) for px, py in self.points],
+                                     self.sim, self.mode_var.get())
+
+    def _render(self):
+        set_button(self.back, enabled=self.step == "pick")
+        if self.step == "box":
+            self.ctrl.pack_forget()
+            self.step_lbl.config(text=f"Step 1 of 2  ·  {self.t['name']}")
+            self.instr.config(text="Drag a box around the area to watch (e.g. the whole life globe)."
+                              + ("  The orange box is the current one." if self.box else ""))
+            self._show((0, 0, self.img.shape[1], self.img.shape[0]))
+            if self.box:
+                bx, by, bw, bh = self.box
+                s = self.scale
+                self.canvas.create_rectangle(bx * s, by * s, (bx + bw) * s, (by + bh) * s, outline=ORANGE,
+                                             width=2, dash=(4, 3), tags="sel")
+            set_button(self.next_btn, text="Next  ▶", enabled=bool(self.box))
+        else:
+            self.ctrl.pack(fill="x", padx=16, pady=(0, 4))
+            self.slider.set(self.sim)
+            self.sim_lbl.config(text=str(self.sim))
+            self.step_lbl.config(text=f"Step 2 of 2  ·  {self.t['name']}")
+            m = self._sel()
+            self._show(tuple(self.box), overlay=m)
+            for px, py in self.points:
+                cx, cy = (px - self.view[0]) * self.scale, (py - self.view[1]) * self.scale
+                self.canvas.create_oval(cx - 5, cy - 5, cx + 5, cy + 5, outline=YELLOW, width=2)
+            share = float(m.mean())
+            self.instr.config(text="With the colour fully showing, click it. Pink = what will be watched. Slide "
+                              "Similarity until the pink covers it but nothing else." if not self.points else
+                              f"Pink = what will be watched ({share:.0%} of the box). When most of it is gone, "
+                              f"{core.hotkey_label(self.t['key'])} gets pressed.")
+            set_button(self.undo, enabled=bool(self.points))
+            set_button(self.next_btn, text="Finish  ✓", enabled=share >= 0.005)
+
+    def _slid(self, v):
+        val = int(round(float(v)))
+        if val != self.sim:
+            self.sim = val
+            self.sim_lbl.config(text=str(val))
+            self._render()
+
+    def _down(self, e):
+        if self.step == "pick":
+            self.points.append(self._to_img(e.x, e.y))
+            self._render()
+            return
+        self._drag0 = (e.x, e.y)
+        self.canvas.delete("sel")
+        self._rect = self.canvas.create_rectangle(e.x, e.y, e.x, e.y, outline=YELLOW, width=2, tags="sel")
+
+    def _drag(self, e):
+        if self._drag0:
+            self.canvas.coords(self._rect, *self._drag0, e.x, e.y)
+
+    def _up(self, e):
+        if not self._drag0:
+            return
+        x0, y0 = self._drag0
+        self._drag0 = None
+        a, b = self._to_img(min(x0, e.x), min(y0, e.y))
+        c, d = self._to_img(max(x0, e.x), max(y0, e.y))
+        if c - a >= 4 and d - b >= 4:
+            self.box = [a, b, c - a, d - b]
+            self.points = []
+            set_button(self.next_btn, enabled=True)
+
+    def _undo(self):
+        if self.points:
+            self.points.pop()
+            self._render()
+
+    def _back(self):
+        self.step = "box"
+        self._render()
+
+    def _next(self):
+        if self.step == "box":
+            if not self.box:
+                return
+            self.step = "pick"
+            self._render()
+            return
+        if float(self._sel().mean()) < 0.005:
+            return
+        self.result = {"box": self.box, "points": self.points, "similarity": self.sim, "mode": self.mode_var.get()}
+        self.destroy()
+
+
+class TriggerRow(tk.Frame):
+    def __init__(self, parent, app: "App", trig: dict):
+        super().__init__(parent, bg=PANEL, highlightthickness=2, highlightbackground=BORDER)
+        self.app, self.tid = app, trig["id"]
+        self._blank = tk.PhotoImage(width=64, height=64)
+        self.img = tk.Label(self, image=self._blank, bg="#0c0a08", borderwidth=0)
+        self.img.pack(side="left", padx=8, pady=8)
+        mid = tk.Frame(self, bg=PANEL)
+        mid.pack(side="left", fill="both", expand=True, padx=4, pady=6)
+        self.title = tk.Label(mid, text="", bg=PANEL, fg=GOLD, font=H_FONT, anchor="w")
+        self.title.pack(anchor="w")
+        self.sub = tk.Label(mid, text="", bg=PANEL, fg=MUTED, font=SMALL, anchor="w")
+        self.sub.pack(anchor="w")
+        self.bar = tk.Canvas(mid, width=260, height=12, bg=PANEL_2, highlightthickness=0)
+        self.bar.pack(anchor="w", pady=(4, 0))
+        right = tk.Frame(self, bg=PANEL)
+        right.pack(side="right", padx=10)
+        self.pill = tk.Label(right, text="", bg=GREY, fg=TEXT, font=PILL_FONT, width=22, pady=4)
+        self.pill.pack(pady=(6, 4))
+        btns = tk.Frame(right, bg=PANEL)
+        btns.pack()
+        button(btns, "Calibrate", lambda: app.calibrate_trigger(self.tid), font=SMALL, pady=3).pack(side="left", padx=2)
+        button(btns, "Edit", lambda: app.edit_trigger(self.tid), font=SMALL, pady=3).pack(side="left", padx=2)
+        self._photo = None
+
+    def update_view(self, trig: dict, value: Optional[float], crop: Optional[np.ndarray], gone: Optional[bool],
+                    live: bool, testing: bool = False):
+        self.title.config(text=trig["name"])
+        self.sub.config(text=f"presses {core.hotkey_label(trig['key'])} below {trig['fire_below']}% · "
+                             f"stops above {trig['rearm_above']}% · "
+                             + (f"every {trig['repeat_min_ms']}-{trig['repeat_max_ms']} ms" if trig.get("repeat", True)
+                                else "once"))
+        if crop is None and trig.get("box") and core.trigger_ref_path(trig["id"]).exists():
+            crop = cv2.imread(str(core.trigger_ref_path(trig["id"])))
+        if crop is not None and crop.size:
+            self._photo = to_photo(crop, 64, 64)
+            self.img.config(image=self._photo)
+        self.bar.delete("all")
+        if not trig.get("enabled", True):
+            self.pill.config(text="OFF", bg=GREY, fg=TEXT)
+        elif not (trig.get("box") and core.trigger_ref_path(trig["id"]).exists()):
+            self.pill.config(text="NOT SET UP - Calibrate", bg=ORANGE, fg="white")
+        elif not live or value is None:
+            self.pill.config(text="ready", bg=GREY, fg=TEXT)
+        else:
+            colour = GREEN if value >= trig["rearm_above"] else (RED if value < trig["fire_below"] else ORANGE)
+            self.bar.create_rectangle(0, 0, 260 * value / 100.0, 12, fill=colour, width=0)
+            for pct in (trig["fire_below"], trig["rearm_above"]):
+                self.bar.create_line(260 * pct / 100.0, 0, 260 * pct / 100.0, 12, fill=TEXT)
+            if gone:
+                verb = "would press" if testing else "pressing"
+                self.pill.config(text=f"GONE {value:.0f}% · {verb} {core.hotkey_label(trig['key'])}", bg=RED, fg="white")
+            else:
+                self.pill.config(text=f"SHOWING {value:.0f}%", bg=GREEN if value >= trig["rearm_above"] else ORANGE,
+                                 fg="white")
+
+
 # ================================================================ report dialog
 def show_report(parent) -> None:
     win = tk.Toplevel(parent, bg=BG)
@@ -930,14 +1296,7 @@ class SettingsDialog(tk.Toplevel):
         if e.keysym == "Escape":
             self._set_hotkey(self._recording, self.hk_vals[self._recording])
             return "break"
-        import sys as _sys
-        win = _sys.platform == "win32"
-        name = core.vk_to_name(e.keycode) if win else None
-        if not name:
-            name = e.keysym.lower() if len(e.keysym) > 1 else e.keysym.lower()
-        alt_mask = 0x20000 if win else 0x8
-        mods = [m for m, bit in (("ctrl", 0x4), ("alt", alt_mask), ("shift", 0x1)) if e.state & bit]
-        self._set_hotkey(self._recording, "+".join(mods + [name]))
+        self._set_hotkey(self._recording, combo_from_event(e))
         return "break"
 
     def _collect(self) -> Optional[dict]:
@@ -1206,6 +1565,19 @@ class App(tk.Tk):
             c = FlaskCard(cards, s["slot"], s["kind"], self.recalibrate)
             c.grid(row=0, column=i, padx=6, sticky="n")
             self.cards[s["slot"]] = c
+
+        # triggers
+        tf = tk.Frame(self, bg=BG)
+        tf.pack(fill="x", padx=22, pady=(4, 0))
+        th = tk.Frame(tf, bg=BG)
+        th.pack(fill="x")
+        tk.Label(th, text="Triggers", bg=BG, fg=GOLD, font=H_FONT).pack(side="left")
+        tk.Label(th, text="press a key when a colour disappears", bg=BG, fg=MUTED, font=SMALL).pack(side="left", padx=8)
+        button(th, "+  Add trigger", self.add_trigger, font=SMALL, pady=3).pack(side="right")
+        self.trig_frame = tk.Frame(tf, bg=BG)
+        self.trig_frame.pack(fill="x", pady=(4, 0))
+        self.trig_rows: Dict[int, TriggerRow] = {}
+        self._rebuild_triggers()
 
         # controls
         ctl = tk.Frame(self, bg=BG)
@@ -1584,6 +1956,102 @@ class App(tk.Tk):
             pass
         self._update_buttons()
 
+    # -- triggers ------------------------------------------------------------------
+    def _rebuild_triggers(self):
+        for w in self.trig_frame.winfo_children():
+            w.destroy()
+        self.trig_rows = {}
+        for t in self.cfg.get("triggers", []):
+            row = TriggerRow(self.trig_frame, self, t)
+            row.pack(fill="x", pady=3)
+            self.trig_rows[t["id"]] = row
+            row.update_view(t, None, None, None, False)
+
+    def _save_trigger(self, t: dict):
+        trigs = self.cfg.setdefault("triggers", [])
+        for i, old in enumerate(trigs):
+            if old["id"] == t["id"]:
+                trigs[i] = t
+                break
+        else:
+            trigs.append(t)
+        core.save_config(self.cfg)
+        self._rebuild_triggers()
+
+    def add_trigger(self):
+        if self.engine.mode != "idle":
+            messagebox.showinfo(core.APP, "Stop first, then add the trigger.")
+            return
+        t = core.new_trigger(self.cfg)
+        dlg = TriggerEditDialog(self, t, is_new=True)
+        self.wait_window(dlg)
+        if isinstance(dlg.result, dict):
+            self._save_trigger(dlg.result)
+            self.write_log(f"Added trigger “{dlg.result['name']}”. Now click its Calibrate button.")
+            self.calibrate_trigger(dlg.result["id"])
+
+    def edit_trigger(self, tid: int):
+        if self.engine.mode != "idle":
+            messagebox.showinfo(core.APP, "Stop first, then edit the trigger.")
+            return
+        t = next(x for x in self.cfg["triggers"] if x["id"] == tid)
+        dlg = TriggerEditDialog(self, t, is_new=False)
+        self.wait_window(dlg)
+        if dlg.result == "delete":
+            self.cfg["triggers"] = [x for x in self.cfg["triggers"] if x["id"] != tid]
+            core.save_config(self.cfg)
+            try:
+                core.trigger_ref_path(tid).unlink()
+            except OSError:
+                pass
+            self._rebuild_triggers()
+            self.write_log(f"Deleted trigger “{t['name']}”.")
+        elif isinstance(dlg.result, dict):
+            self._save_trigger(dlg.result)
+            self.write_log(f"Saved trigger “{dlg.result['name']}”.")
+
+    def calibrate_trigger(self, tid: int):
+        if self.engine.mode != "idle":
+            messagebox.showinfo(core.APP, "Stop first, then calibrate.")
+            return
+        self._save_window()
+        t = next(x for x in self.cfg["triggers"] if x["id"] == tid)
+        if not messagebox.askokcancel(core.APP, f"Make sure “{t['name']}” is fully showing in your program.\n\n"
+                                      "When you click OK this window hides for a moment and takes a picture."):
+            return
+        img = self._capture()
+        if img is None:
+            return
+        dlg = TriggerCalibDialog(self, img, t)
+        self.wait_window(dlg)
+        if not dlg.result:
+            return
+        x, y, w, h = dlg.result["box"]
+        core.DATA_DIR.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(core.trigger_ref_path(tid)), img[y:y + h, x:x + w])
+        t = dict(t, box=dlg.result["box"], liquid_points=[[px - x, py - y] for px, py in dlg.result["points"]],
+                 similarity=dlg.result["similarity"], pick_mode=dlg.result["mode"])
+        self._save_trigger(t)
+        self.write_log(f"Calibrated trigger “{t['name']}”. Check it in Test mode.")
+
+    def _show_triggers_live(self):
+        live = self.engine.mode in ("test", "run")
+        with self.engine.lock:
+            vals = dict(self.engine.trig_values)
+            crops = dict(self.engine.trig_crops)
+        c = self.engine.controller
+        for t in self.cfg.get("triggers", []):
+            row = self.trig_rows.get(t["id"])
+            if row is None:
+                continue
+            v = vals.get(t["id"])
+            gone = None
+            if c is not None and t["id"] in c.tstate:
+                gone = c.tstate[t["id"]]["gone"]
+            elif v is not None:
+                gone = v < t["fire_below"]
+            row.update_view(t, v, crops.get(t["id"]) if live else None, gone, live, self.engine.mode == "test")
+
     def _hotkey(self, name: str):
         if name == "hotkey_toggle":
             if self.engine.mode == "test":
@@ -1692,6 +2160,9 @@ class App(tk.Tk):
         elif self.engine.reader is not None and bool(self.engine.reader.size_mismatch) != self._resized:
             self._check_resize()
         self._update_guide()
+        if self.engine.mode in ("test", "run") or getattr(self, "_trig_was_live", False):
+            self._show_triggers_live()
+        self._trig_was_live = self.engine.mode in ("test", "run")
         if self.mini is not None:
             with self.engine.lock:
                 r = self.engine.latest

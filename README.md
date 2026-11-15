@@ -26,6 +26,13 @@ Also:
   and nothing is pressed until you resize it back or recalibrate.
 - Town mode plays a sound and flashes the status when it starts or stops.
 
+## Triggers
+Under the flasks: **+ Add trigger** watches an area (e.g. the blue layer on the life globe) and
+presses a key when its colour disappears. Calibrate it while the colour is fully showing (box,
+click the colour, Similarity slider). Edit sets the name, key (default Q, combinations allowed),
+the "start pressing below" and "stop when back above" percentages (default 20% / 50%), repeat
+on/off and the random repeat interval (default 200-600 ms).
+
 ## Auto-update
 Releases come from https://github.com/Danielb1606/DanielsAssignment/releases.
 To publish a new version: raise `__version__` in `daniels_assignment.py` and push to main.

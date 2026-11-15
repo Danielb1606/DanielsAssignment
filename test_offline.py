@@ -393,3 +393,46 @@ sl.town = False; sl.hidden = True; cl.run(1); sl.hidden = False; cl.run(2)
 assert not cl.town_mode and len(sl.presses) > n
 print("town mode: silent until a loading screen, then resumes")
 print("ALL CHECKS PASSED")
+
+# 23. triggers: coverage of the blue layer, fire / repeat / re-arm
+globe = cv2.imread(str(Path(__file__).parent / "globe.png"))
+gh, gw = globe.shape[:2]
+tm = da.TriggerModel(globe, [(269, 162)], 55, "box")
+full_cov = tm.coverage(globe)
+gone = globe.copy()
+hsvg = cv2.cvtColor(gone, cv2.COLOR_BGR2HSV)
+bluepx = (da._circ_hue_dist(hsvg[..., 0].astype(int), 100) <= 25) & (hsvg[..., 1] > 50)
+gone[bluepx] = (40, 20, 120)                      # blue layer replaced by the red globe underneath
+half = globe.copy(); half[:, : gw // 2][bluepx[:, : gw // 2]] = (40, 20, 120)
+print(f"trigger coverage: full {full_cov:.0f}%, gone {tm.coverage(gone):.0f}%, partly {tm.coverage(half):.0f}%")
+assert full_cov > 90 and tm.coverage(gone) < 5
+
+class Trig:
+    def __init__(s): s.t = 0.0; s.cov = 100.0; s.keys = []
+    def now(s): return s.t
+    def sleep(s, dt): s.t += dt
+    def read(s): return {k: da.SlotReading(True, False, False, 0.5, 0.0, None) for k in range(1, 6)}
+trig = dict(da.TRIGGER_DEFAULTS, id=1)
+tsim = Trig()
+ct = da.FlaskController(tsim.read, lambda k: True, clock=tsim.now, sleep=tsim.sleep, rng=random.Random(9),
+                        log=lambda m: None, triggers=[trig], read_triggers=lambda: {1: tsim.cov},
+                        press_key=lambda combo: (tsim.keys.append((round(tsim.t, 3), combo)), True)[1])
+ct.run(2); assert tsim.keys == []                     # blue showing: nothing
+tsim.cov = 10; t0 = tsim.t; ct.run(3)                  # gone: q repeatedly
+times = [t for t, _ in tsim.keys]
+gaps = [b - a for a, b in zip(times, times[1:])]
+assert tsim.keys and all(k == "q" for _, k in tsim.keys)
+assert 0.15 <= times[0] - t0 <= 0.55, times[0] - t0        # first press after the 150-300 ms delay (+ check interval)
+assert all(0.2 <= g <= 0.61 for g in gaps), gaps            # repeats every 0.2-0.6 s
+tsim.cov = 35; n = len(tsim.keys); ct.run(1.5)               # between thresholds: still gone -> keeps pressing
+assert len(tsim.keys) > n
+tsim.cov = 60; ct.run(0.3); n = len(tsim.keys); ct.run(3)     # back above 50%: stops
+assert len(tsim.keys) == n
+once = dict(trig, repeat=False); tsim2 = Trig(); tsim2.cov = 5
+c2 = da.FlaskController(tsim2.read, lambda k: True, clock=tsim2.now, sleep=tsim2.sleep, rng=random.Random(9),
+                        log=lambda m: None, triggers=[once], read_triggers=lambda: {1: tsim2.cov},
+                        press_key=lambda combo: (tsim2.keys.append(combo), True)[1])
+c2.run(3); assert tsim2.keys == ["q"]
+assert not da.validate_trigger(dict(trig)) and da.validate_trigger(dict(trig, fire_below=60))
+print(f"trigger: {len(times)} presses, gaps {min(gaps):.2f}-{max(gaps):.2f}s, stops when blue returns; once-mode ok")
+print("ALL CHECKS PASSED")

@@ -57,7 +57,7 @@ RECENT_ERRORS: "collections.deque[str]" = collections.deque(maxlen=20)   # for "
 def note_error(where: str) -> None:
     """Remember the current exception (with its full traceback) for diagnostics."""
     RECENT_ERRORS.append(f"[{time.strftime('%H:%M:%S')}] {where}\n{traceback.format_exc()}")
-__version__ = "1.4.3"
+__version__ = "1.5.0"
 # Saved next to the .exe when packaged (a one-file .exe unpacks itself to a
 # temporary folder, so __file__ would point somewhere that gets deleted).
 _BASE = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
@@ -73,6 +73,7 @@ REFIRE_COOLDOWN = 0.5                # min gap between presses of the same slot
 VERIFY_WINDOW = 1.2                  # time for a press to show an effect
 FAILS_FOR_TOWN = 2                   # presses with no effect before town mode
 HIDDEN_POLLS_FOR_AREA_CHANGE = 2     # belt hidden this many checks = area change
+TRIGGER_TAG = 1000       # queue ids >= this are trigger presses, not flasks
 PAUSE_DIM = 0.8          # belt this much darker than calibration = your program is paused
 CHANGE_MIN = 6.0                     # avg grey-level change that counts as "the press did something"
 
@@ -209,7 +210,51 @@ def default_config() -> dict:
             {"slot": s, "key": str(s), "kind": SLOT_KINDS[s], "box": None, "bar_box": None}
             for s in range(1, 6)
         ],
+        "triggers": [],
     }
+
+
+# ---------------------------------------------------------------- triggers
+# "When this colour disappears, press this key." Each trigger watches one area
+# (e.g. the blue layer on the life globe) picked like a flask's liquid.
+TRIGGER_DEFAULTS = {
+    "name": "Blue layer",
+    "key": "q",
+    "enabled": True,
+    "fire_below": 20,         # % of the calibrated colour still showing -> start pressing
+    "rearm_above": 50,        # % back -> stop pressing and wait for the next time
+    "repeat": True,
+    "repeat_min_ms": 200,
+    "repeat_max_ms": 600,
+    "box": None, "liquid_points": [], "similarity": 55,
+    "pick_mode": "shape",
+}
+
+
+def new_trigger(cfg: dict) -> dict:
+    ids = [t["id"] for t in cfg.get("triggers", [])]
+    t = json.loads(json.dumps(TRIGGER_DEFAULTS))
+    t["id"] = max(ids, default=0) + 1
+    if ids:
+        t["name"] = f"Trigger {t['id']}"
+    return t
+
+
+def trigger_ref_path(tid: int) -> Path:
+    return DATA_DIR / f"trigger{tid}_reference.png"
+
+
+def validate_trigger(t: dict) -> List[str]:
+    errs = []
+    if not normalize_hotkey(t.get("key", "")):
+        errs.append("Pick a key for the trigger to press.")
+    if not 0 <= t["fire_below"] < t["rearm_above"] <= 100:
+        errs.append("'Fire below' must be lower than 'Re-arm above' (0-100%).")
+    if not 20 <= t["repeat_min_ms"] <= t["repeat_max_ms"] <= 60000:
+        errs.append("Repeat: min must be ≤ max (20-60000 ms).")
+    if not str(t.get("name", "")).strip():
+        errs.append("Give the trigger a name.")
+    return errs
 
 
 def load_config() -> dict:
@@ -630,6 +675,35 @@ def slot_points(s: dict) -> List[Tuple[int, int]]:
     return []
 
 
+class TriggerModel:
+    """How much of the calibrated colour is still showing in a trigger's box (0-100%)."""
+
+    def __init__(self, ref_bgr: np.ndarray, points, similarity: float, mode: str):
+        self.h, self.w = ref_bgr.shape[:2]
+        pts = [(int(x), int(y)) for x, y in points if 0 <= x < self.w and 0 <= y < self.h]
+        hsv = cv2.cvtColor(ref_bgr, cv2.COLOR_BGR2HSV)
+        self.seeds = [_seed(hsv, x, y) for x, y in pts]
+        self.similarity = similarity
+        self.mask = liquid_selection(ref_bgr, pts, similarity, mode)
+
+    def coverage(self, crop_bgr: np.ndarray) -> Optional[float]:
+        if not self.mask.any():
+            return None
+        if crop_bgr.shape[:2] != (self.h, self.w):
+            crop_bgr = cv2.resize(crop_bgr, (self.w, self.h))
+        hit = colour_match(cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2HSV), self.seeds, self.similarity)
+        return 100.0 * float(hit[self.mask].mean())
+
+
+def trigger_model(t: dict) -> Optional[TriggerModel]:
+    p = trigger_ref_path(t["id"])
+    if not (t.get("box") and p.exists()):
+        return None
+    ref = cv2.imread(str(p))
+    return TriggerModel(ref, [tuple(q) for q in t.get("liquid_points", [])],
+                        t.get("similarity", DEFAULT_SIMILARITY), t.get("pick_mode", "shape"))
+
+
 def model_for(s: dict) -> SlotModel:
     return SlotModel(cv2.imread(str(ref_path(s["slot"]))), slot_points(s),
                      s.get("similarity", DEFAULT_SIMILARITY), s.get("pick_mode", "shape"))
@@ -774,7 +848,16 @@ class FlaskReader:
             if s["box"] is None or not ref_path(s["slot"]).exists():
                 raise SystemExit(f"Slot {s['slot']} is not calibrated. Run: calibrate")
             self.models[s["slot"]] = model_for(s)
-        boxes = [s["box"] for s in cfg["slots"]] + [s["bar_box"] for s in cfg["slots"] if s["bar_box"]]
+        self.trigger_models: Dict[int, TriggerModel] = {}
+        for t in cfg.get("triggers", []):
+            m = trigger_model(t) if t.get("enabled", True) else None
+            if m is not None:
+                self.trigger_models[t["id"]] = m
+        self.trigger_boxes = {t["id"]: t["box"] for t in cfg.get("triggers", []) if t["id"] in self.trigger_models}
+        self.trigger_values: Dict[int, Optional[float]] = {}
+        self.trigger_crops: Dict[int, np.ndarray] = {}
+        boxes = [s["box"] for s in cfg["slots"]] + [s["bar_box"] for s in cfg["slots"] if s["bar_box"]] + \
+            list(self.trigger_boxes.values())
         self.bx0 = min(b[0] for b in boxes)
         self.by0 = min(b[1] for b in boxes)
         self.bx1 = max(b[0] + b[2] for b in boxes)
@@ -795,6 +878,7 @@ class FlaskReader:
         return self.grabber.grab(ox + self.bx0, oy + self.by0, self.bx1 - self.bx0, self.by1 - self.by0)
 
     def read(self) -> Optional[Dict[int, SlotReading]]:
+        self.trigger_values = {}
         # If the window was resized since calibration the boxes no longer line
         # up: report nothing (so nothing gets pressed) and flag it for the app.
         if self.frame_source is None and self.expected_size and self.locator:
@@ -824,6 +908,12 @@ class FlaskReader:
                 bar = region[by - self.by0:by - self.by0 + bh, bx - self.bx0:bx - self.bx0 + bw]
             self.last_crops[s["slot"]] = (crop, bar)
             out[s["slot"]] = self.models[s["slot"]].read(crop, bar, self.bar_bgr)
+        vals = {}
+        for tid, (x, y, w, h) in self.trigger_boxes.items():
+            crop = region[y - self.by0:y - self.by0 + h, x - self.bx0:x - self.bx0 + w]
+            self.trigger_crops[tid] = crop
+            vals[tid] = self.trigger_models[tid].coverage(crop)
+        self.trigger_values = vals
         return out
 
 
@@ -841,8 +931,15 @@ class FlaskController:
                  sleep: Callable[[float], None] = time.sleep,
                  rng: Optional[random.Random] = None,
                  log: Callable[[str], None] = print,
-                 settings: Optional[dict] = None):
+                 settings: Optional[dict] = None,
+                 triggers: Optional[List[dict]] = None,
+                 read_triggers: Callable[[], Dict[int, Optional[float]]] = lambda: {},
+                 press_key: Optional[Callable[[str], bool]] = None):
         self.read, self.press = read, press
+        self.triggers = [t for t in (triggers or []) if t.get("enabled", True)]
+        self.read_triggers = read_triggers
+        self.press_key = press_key or (lambda combo: False)
+        self.tstate: Dict[int, dict] = {t["id"]: {"gone": False, "next": 0.0} for t in self.triggers}
         st = settings or DEFAULT_SETTINGS
         self.poll_interval = 1.0 / float(st["checks_per_second"])
         self.delay_range = (st["delay_min_ms"] / 1000.0, st["delay_max_ms"] / 1000.0)
@@ -971,6 +1068,8 @@ class FlaskController:
 
         if self.paused:
             return
+        if not self.town_mode:
+            self._run_triggers(now)
         if self.town_mode:
             # every few seconds, quietly try one quicksilver; if it works, town mode ends
             if (self.town_retry > 0 and self.probe_slot is None and now - self.last_probe >= self.town_retry
@@ -992,6 +1091,30 @@ class FlaskController:
         for slot in INSTILLING_SLOTS:
             if r[slot].visible and r[slot].full and self._can_schedule(slot, now):
                 self._schedule(slot, now)
+
+    def _run_triggers(self, now: float) -> None:
+        values = self.read_triggers() or {}
+        for i, t in enumerate(self.triggers):
+            c = values.get(t["id"])
+            st = self.tstate[t["id"]]
+            if c is None:
+                continue
+            if not st["gone"] and c < t["fire_below"]:
+                st["gone"] = True
+                st["next"] = now + self.rng.uniform(*self.delay_range)
+                self.log(f"[{now:8.3f}] {t['name']}: gone ({c:.0f}%) -> pressing {hotkey_label(t['key'])}")
+            elif st["gone"] and c >= t["rearm_above"]:
+                st["gone"] = False
+                self.log(f"[{now:8.3f}] {t['name']}: back ({c:.0f}%) - stopped pressing")
+            tag = TRIGGER_TAG + i
+            if st["gone"] and tag not in self.queued and st["next"] != float("inf"):
+                fire = max(now, st["next"])           # exact time, not the next check
+                heapq.heappush(self.queue, _Pending(fire, tag))
+                self.queued.add(tag)
+                if t.get("repeat", True):
+                    st["next"] = fire + self.rng.uniform(t["repeat_min_ms"], t["repeat_max_ms"]) / 1000.0
+                else:
+                    st["next"] = float("inf")       # once per disappearance
 
     def _changed(self, slot: int, rd: SlotReading) -> bool:
         """Did the flask visibly change since just before it was pressed?"""
@@ -1025,6 +1148,13 @@ class FlaskController:
             p = heapq.heappop(self.queue)
             self.queued.discard(p.slot)
             if self.paused or self.program_paused or (self.town_mode and p.slot != self.probe_slot):
+                continue
+            if p.slot >= TRIGGER_TAG:
+                t = self.triggers[p.slot - TRIGGER_TAG]
+                if not self.tstate[t["id"]]["gone"]:
+                    continue                          # it came back meanwhile
+                if self.press_key(t["key"]):
+                    self.log(f"[{now:8.3f}] {t['name']}: pressed {hotkey_label(t['key'])}")
                 continue
             if self.press(p.slot):
                 self.last_press[p.slot] = now
@@ -1202,6 +1332,60 @@ class KeySender:
         inp = self._INPUT(1)                                   # INPUT_KEYBOARD
         inp.u.ki = ki
         return self._user32.SendInput(1, self._ct.byref(inp), self._ct.sizeof(self._INPUT))
+
+    NAME_TO_VK = {**{chr(c).lower(): c for c in range(65, 91)}, **{chr(c): c for c in range(48, 58)},
+                  **{f"f{i}": 111 + i for i in range(1, 13)}, **{f"num{i}": 96 + i for i in range(10)},
+                  "space": 32, "tab": 9, "enter": 13, "backspace": 8, "insert": 45, "delete": 46, "home": 36,
+                  "end": 35, "page_up": 33, "page_down": 34, "left": 37, "up": 38, "right": 39, "down": 40,
+                  "`": 192, "-": 189, "=": 187, "[": 219, "]": 221, "\\": 220, ";": 186, "'": 222, ",": 188,
+                  ".": 190, "/": 191, "ctrl": 0x11, "alt": 0x12, "shift": 0x10}
+
+    def _send_vk_win(self, vk: int, up: bool) -> None:
+        scan = self._user32.MapVirtualKeyW(vk, 0)
+        KEYUP, SCANCODE, EXTENDED = 0x0002, 0x0008, 0x0001
+        ext = EXTENDED if vk in (33, 34, 35, 36, 37, 38, 39, 40, 45, 46) else 0
+        if self.method == "scancode":
+            ki = self._KEYBDINPUT(0, scan, SCANCODE | ext | (KEYUP if up else 0), 0, 0)
+        else:
+            ki = self._KEYBDINPUT(vk, scan, ext | (KEYUP if up else 0), 0, 0)
+        inp = self._INPUT(1)
+        inp.u.ki = ki
+        self._user32.SendInput(1, self._ct.byref(inp), self._ct.sizeof(self._INPUT))
+
+    def press_combo(self, combo: str, check_focus: bool = True) -> bool:
+        """Press any key or combination, e.g. 'q' or 'shift+q'."""
+        combo = normalize_hotkey(combo)
+        if not combo or (check_focus and not self.locator.is_focused()):
+            return False
+        parts = combo.split("+")
+        mods, key = parts[:-1], parts[-1]
+        hold = self.hold_time()
+        if self.win:
+            vks = [self.NAME_TO_VK[m] for m in mods]
+            kvk = self.NAME_TO_VK.get(key)
+            if kvk is None:
+                return False
+            for v in vks:
+                self._send_vk_win(v, up=False)
+            self._send_vk_win(kvk, up=False)
+            time.sleep(hold)
+            self._send_vk_win(kvk, up=True)
+            for v in reversed(vks):
+                self._send_vk_win(v, up=True)
+            return True
+        from pynput.keyboard import Key
+        pk = {"shift": Key.shift, "ctrl": Key.ctrl, "alt": Key.alt}
+        main = getattr(Key, key, None) if len(key) > 1 else key
+        if main is None:
+            return False
+        for m in mods:
+            self.kb.press(pk[m])
+        self.kb.press(main)
+        time.sleep(hold)
+        self.kb.release(main)
+        for m in reversed(mods):
+            self.kb.release(pk[m])
+        return True
 
     def hold_time(self) -> float:
         return self.rng.uniform(*self.hold_range)
