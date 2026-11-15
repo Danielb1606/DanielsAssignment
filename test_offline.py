@@ -222,3 +222,27 @@ for s_ in range(1, 6):
         assert d["bar_box"][:2] == [bars[s_][0] + 55, bars[s_][1] + 37]
 print("auto-detect (saved calibration, window moved): all five reused")
 print("ALL CHECKS PASSED")
+
+# 15. town mode: one flask that never visibly changes must NOT trigger it;
+#     a flask that drains a little (but still reads FULL) counts as working
+class One:
+    def __init__(s): s.t = 0.0; s.sig = {k: np.zeros((20, 12), np.float32) for k in range(1, 6)}; s.presses = []
+    def now(s): return s.t
+    def sleep(s, dt): s.t += dt
+    def read(s): return {k: da.SlotReading(True, True, False, 1.0, 1.0, s.sig[k].copy()) for k in range(1, 6)}
+    def press(s, k):
+        s.presses.append(k)
+        if k != 1: s.sig[k] += 20          # visibly drains but still reads FULL
+        return True                        # slot 1 (life) never changes
+sim = One(); logs = []
+c = da.FlaskController(sim.read, sim.press, clock=sim.now, sleep=sim.sleep, rng=random.Random(3), log=logs.append)
+c.run(1.6)
+assert not c.town_mode, logs
+assert sim.presses.count(2) == 1, sim.presses          # not re-pressed until it has read NOT FULL
+print("single unresponsive flask: no town mode; used flask waits to refill")
+sim2 = One(); sim2.press = lambda k: (sim2.presses.append(k), True)[1]     # nothing ever changes = town
+c2 = da.FlaskController(sim2.read, sim2.press, clock=sim2.now, sleep=sim2.sleep, rng=random.Random(3), log=lambda m: None)
+c2.run(4)
+assert c2.town_mode
+print("every flask unresponsive: town mode")
+print("ALL CHECKS PASSED")

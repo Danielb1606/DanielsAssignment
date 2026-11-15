@@ -50,7 +50,7 @@ import cv2
 import numpy as np
 
 APP = "Daniels Assignment"
-__version__ = "1.3.0"
+__version__ = "1.3.1"
 # Saved next to the .exe when packaged (a one-file .exe unpacks itself to a
 # temporary folder, so __file__ would point somewhere that gets deleted).
 _BASE = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
@@ -66,6 +66,7 @@ REFIRE_COOLDOWN = 0.5                # min gap between presses of the same slot
 VERIFY_WINDOW = 1.2                  # time for a press to show an effect
 FAILS_FOR_TOWN = 2                   # presses with no effect before town mode
 HIDDEN_POLLS_FOR_AREA_CHANGE = 2     # belt hidden this many checks = area change
+CHANGE_MIN = 6.0                     # avg grey-level change that counts as "the press did something"
 
 # Everything above can be changed in the app's Settings panel; these are the defaults.
 DEFAULT_SETTINGS = {
@@ -322,6 +323,7 @@ class SlotReading:
     active: bool
     fill: float          # rough 0-1 estimate of how full the flask looks
     top_match: float     # share of the top-of-liquid pixels that still match
+    sig: Optional[np.ndarray] = None   # small picture of the liquid area, to spot any change
 
 
 DEFAULT_SIMILARITY = 55   # calibration slider default (1-100)
@@ -490,7 +492,13 @@ class SlotModel:
             dist = np.abs(bar_crop.astype(int) - np.array(bar_bgr)).max(axis=2)
             active = int((dist <= BAR_RGB_TOL).sum()) >= BAR_MIN_PIXELS
 
-        return SlotReading(visible, full and visible, active and visible, fill, top_match)
+        sig = None
+        if self.mask.any():
+            ys, xs = np.nonzero(self.mask)
+            area = crop_bgr[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
+            sig = cv2.resize(cv2.cvtColor(area, cv2.COLOR_BGR2GRAY), (12, 20),
+                             interpolation=cv2.INTER_AREA).astype(np.float32)
+        return SlotReading(visible, full and visible, active and visible, fill, top_match, sig)
 
 
 def slot_points(s: dict) -> List[Tuple[int, int]]:
@@ -723,7 +731,12 @@ class FlaskController:
         self.queued: set = set()
         self.last_press: Dict[int, float] = {}
         self.verify: Dict[int, float] = {}       # slot -> deadline
+        self.before: Dict[int, Optional[np.ndarray]] = {}   # slot -> look just before the press
+        self.last: Dict[int, SlotReading] = {}
         self.fails = 0
+        self.failed_slots: set = set()
+        self.wait_refill: set = set()      # used; don't press again until it has read NOT FULL
+        self.warned_full: set = set()
         self.town_mode = False
         self.hidden_streak = 0
         self.belt_hidden_in_town = False
@@ -744,6 +757,7 @@ class FlaskController:
         if self.town_mode:
             self.town_mode = False
             self.fails = 0
+            self.failed_slots.clear()
             self.log(f"TOWN MODE OFF - {why}.")
             self.on_town(False)
 
@@ -766,14 +780,19 @@ class FlaskController:
 
         # did recent presses do anything?
         for slot, deadline in list(self.verify.items()):
-            if not r[slot].full or r[slot].active:
+            if not r[slot].full or r[slot].active or self._changed(slot, r[slot]):
                 self.verify.pop(slot, None)
                 self.fails = 0
+                self.failed_slots.clear()
+                self.wait_refill.add(slot)
             elif now >= deadline:
                 self.verify.pop(slot, None)
+                self.wait_refill.discard(slot)
                 self.fails += 1
+                self.failed_slots.add(slot)
                 self.log(f"[{now:8.3f}] slot {slot}: press had no effect ({self.fails}/{self.fails_for_town})")
-                if self.fails >= self.fails_for_town:
+                # a real town stops every flask, so one misbehaving flask isn't enough
+                if self.fails >= self.fails_for_town and len(self.failed_slots) >= 2:
                     self.enter_town("flasks are not being used")
                     break
 
@@ -784,6 +803,15 @@ class FlaskController:
             if was_full and not rd.full and rd.visible and not recently and self.town_mode:
                 self.leave_town(f"slot {slot} was used manually")
             self.prev_full[slot] = rd.full
+            if not rd.full and rd.visible:
+                self.wait_refill.discard(slot)        # it emptied - may fire again once full
+                self.warned_full.discard(slot)
+            elif (slot in self.wait_refill and slot not in self.warned_full and slot not in self.verify
+                  and now - self.last_press.get(slot, -1e9) > 5.0):
+                self.warned_full.add(slot)
+                self.log(f"Flask {slot} still reads FULL after being used - its pink area may include "
+                         "empty glass. Recalibrate it with a lower Similarity.")
+        self.last = r
 
         if self.paused or self.town_mode:
             return
@@ -797,6 +825,13 @@ class FlaskController:
             if r[slot].visible and r[slot].full and self._can_schedule(slot, now):
                 self._schedule(slot, now)
 
+    def _changed(self, slot: int, rd: SlotReading) -> bool:
+        """Did the flask visibly change since just before it was pressed?"""
+        before = self.before.get(slot)
+        if before is None or rd.sig is None or before.shape != rd.sig.shape:
+            return False
+        return float(np.abs(rd.sig - before).mean()) > CHANGE_MIN
+
     def _quicksilver_running(self, r: Dict[int, SlotReading], now: float) -> bool:
         for slot in QUICKSILVER_SLOTS:
             if r[slot].active or slot in self.queued or slot in self.verify:
@@ -806,7 +841,7 @@ class FlaskController:
         return False
 
     def _can_schedule(self, slot: int, now: float) -> bool:
-        if slot in self.queued or slot in self.verify:
+        if slot in self.queued or slot in self.verify or slot in self.wait_refill:
             return False
         return now - self.last_press.get(slot, -1e9) >= self.cooldown
 
@@ -826,6 +861,8 @@ class FlaskController:
             if self.press(p.slot):
                 self.last_press[p.slot] = now
                 self.verify[p.slot] = now + self.verify_window
+                prev = self.last.get(p.slot)
+                self.before[p.slot] = prev.sig if prev is not None else None
                 self.log(f"[{now:8.3f}] pressed {p.slot}")
             else:
                 self.log(f"[{now:8.3f}] skipped {p.slot} (your program's window isn't focused)")
