@@ -50,7 +50,7 @@ import cv2
 import numpy as np
 
 APP = "Daniels Assignment"
-__version__ = "1.3.2"
+__version__ = "1.3.3"
 # Saved next to the .exe when packaged (a one-file .exe unpacks itself to a
 # temporary folder, so __file__ would point somewhere that gets deleted).
 _BASE = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
@@ -74,12 +74,19 @@ DEFAULT_SETTINGS = {
     "checks_per_second": 4,
     "delay_min_ms": 150,
     "delay_max_ms": 300,
-    "key_hold_ms": 30,
+    "key_hold_min_ms": 20,
+    "key_hold_max_ms": 90,
+    "key_method": "scancode",
     "refire_cooldown_ms": 500,
     "verify_ms": 1200,
     "fails_for_town": 2,
     "sound_alerts": True,
 }
+
+
+KEY_METHODS = {"scancode": "Hardware scan code (most compatible)",
+               "virtual": "Virtual key code",
+               "typed": "Typed character (old method)"}
 
 
 def get_settings(cfg: dict) -> dict:
@@ -107,8 +114,10 @@ def validate_settings(st: dict) -> List[str]:
         errs.append("Checks per second must be between 1 and 20.")
     if not 0 <= st["delay_min_ms"] <= st["delay_max_ms"] <= 5000:
         errs.append("Press delay: min must be ≤ max (0-5000 ms).")
-    if not 5 <= st["key_hold_ms"] <= 500:
-        errs.append("Key hold must be 5-500 ms.")
+    if not 5 <= st["key_hold_min_ms"] <= st["key_hold_max_ms"] <= 1000:
+        errs.append("Key hold: min must be ≤ max (5-1000 ms).")
+    if st.get("key_method") not in KEY_METHODS:
+        errs.append("Unknown key sending method.")
     if not 0 <= st["refire_cooldown_ms"] <= 10000:
         errs.append("Cooldown must be 0-10000 ms.")
     if not 300 <= st["verify_ms"] <= 10000:
@@ -891,21 +900,84 @@ class FlaskController:
 
 # ================================================================ keyboard
 class KeySender:
-    def __init__(self, cfg: dict, locator: WindowLocator):
-        from pynput.keyboard import Controller
-        self.kb = Controller()
+    """Presses a flask key like a real keyboard would.
+
+    On Windows it uses SendInput with the key's hardware scan code (the
+    default), so programs that read raw keyboard input see it too. The old
+    method typed the character, which many programs ignore."""
+
+    def __init__(self, cfg: dict, locator: WindowLocator, rng: Optional[random.Random] = None):
         st = get_settings(cfg)
         self.keys = {s["slot"]: st["keys"][str(s["slot"])] for s in cfg["slots"]}
-        self.hold = st["key_hold_ms"] / 1000.0
+        self.hold_range = (st["key_hold_min_ms"] / 1000.0, st["key_hold_max_ms"] / 1000.0)
+        self.method = st.get("key_method", "scancode")
         self.locator = locator
+        self.rng = rng or random.Random()
+        self.win = sys.platform == "win32" and self.method != "typed"
+        if self.win:
+            self._setup_win()
+        else:
+            from pynput.keyboard import Controller
+            self.kb = Controller()
 
-    def __call__(self, slot: int) -> bool:
-        if not self.locator.is_focused():
+    def _setup_win(self):
+        import ctypes
+        from ctypes import wintypes
+        ULONG_PTR = ctypes.c_size_t
+
+        class KEYBDINPUT(ctypes.Structure):
+            _fields_ = [("wVk", wintypes.WORD), ("wScan", wintypes.WORD), ("dwFlags", wintypes.DWORD),
+                        ("time", wintypes.DWORD), ("dwExtraInfo", ULONG_PTR)]
+
+        class MOUSEINPUT(ctypes.Structure):
+            _fields_ = [("dx", wintypes.LONG), ("dy", wintypes.LONG), ("mouseData", wintypes.DWORD),
+                        ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD), ("dwExtraInfo", ULONG_PTR)]
+
+        class HARDWAREINPUT(ctypes.Structure):
+            _fields_ = [("uMsg", wintypes.DWORD), ("wParamL", wintypes.WORD), ("wParamH", wintypes.WORD)]
+
+        class _U(ctypes.Union):
+            _fields_ = [("ki", KEYBDINPUT), ("mi", MOUSEINPUT), ("hi", HARDWAREINPUT)]
+
+        class INPUT(ctypes.Structure):
+            _fields_ = [("type", wintypes.DWORD), ("u", _U)]
+
+        self._ct, self._INPUT, self._KEYBDINPUT = ctypes, INPUT, KEYBDINPUT
+        self._user32 = ctypes.windll.user32
+        self._user32.VkKeyScanW.restype = ctypes.c_short
+        self._codes = {}
+        for slot, k in self.keys.items():
+            vk = self._user32.VkKeyScanW(ord(k)) & 0xFF
+            scan = self._user32.MapVirtualKeyW(vk, 0)          # MAPVK_VK_TO_VSC
+            self._codes[slot] = (vk, scan)
+
+    def _send_win(self, slot: int, up: bool) -> int:
+        vk, scan = self._codes[slot]
+        KEYUP, SCANCODE = 0x0002, 0x0008
+        if self.method == "scancode":
+            ki = self._KEYBDINPUT(0, scan, SCANCODE | (KEYUP if up else 0), 0, 0)
+        else:
+            ki = self._KEYBDINPUT(vk, scan, KEYUP if up else 0, 0, 0)
+        inp = self._INPUT(1)                                   # INPUT_KEYBOARD
+        inp.u.ki = ki
+        return self._user32.SendInput(1, self._ct.byref(inp), self._ct.sizeof(self._INPUT))
+
+    def hold_time(self) -> float:
+        return self.rng.uniform(*self.hold_range)
+
+    def __call__(self, slot: int, check_focus: bool = True) -> bool:
+        if check_focus and not self.locator.is_focused():
             return False
-        k = self.keys[slot]
-        self.kb.press(k)
-        time.sleep(self.hold)
-        self.kb.release(k)
+        hold = self.hold_time()
+        if self.win:
+            self._send_win(slot, up=False)
+            time.sleep(hold)
+            self._send_win(slot, up=True)
+        else:
+            k = self.keys[slot]
+            self.kb.press(k)
+            time.sleep(hold)
+            self.kb.release(k)
         return True
 
 

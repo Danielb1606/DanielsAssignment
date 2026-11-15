@@ -264,3 +264,15 @@ c4.run(6)
 assert c4.town_mode and len({k for k in sim4.presses if k >= 3}) >= 2, sim4.presses
 print("quicksilvers unresponsive (rotating between them): town mode")
 print("ALL CHECKS PASSED")
+
+# 17. key hold: random 20-90 ms by default; settings validate
+st = da.get_settings({})
+assert (st["key_hold_min_ms"], st["key_hold_max_ms"], st["key_method"]) == (20, 90, "scancode")
+assert not da.validate_settings(st)
+bad = dict(st); bad["key_hold_min_ms"] = 100; bad["key_hold_max_ms"] = 50
+assert any("Key hold" in e for e in da.validate_settings(bad))
+ks = da.KeySender.__new__(da.KeySender); ks.hold_range = (0.02, 0.09); ks.rng = random.Random(5)
+holds = [ks.hold_time() for _ in range(500)]
+assert 0.02 <= min(holds) and max(holds) <= 0.09 and max(holds) - min(holds) > 0.05
+print(f"key hold random {min(holds)*1000:.0f}-{max(holds)*1000:.0f} ms")
+print("ALL CHECKS PASSED")

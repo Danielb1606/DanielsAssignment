@@ -795,7 +795,8 @@ class SettingsDialog(tk.Toplevel):
         ("checks_per_second", "Checks per second", "How often the flasks are read."),
         ("delay_min_ms", "Press delay - min (ms)", "Random wait before each press. Your course requires 150-300."),
         ("delay_max_ms", "Press delay - max (ms)", ""),
-        ("key_hold_ms", "Key hold (ms)", "How long each key is held down."),
+        ("key_hold_min_ms", "Key hold - min (ms)", "Each key is held a random time in this range."),
+        ("key_hold_max_ms", "Key hold - max (ms)", ""),
         ("refire_cooldown_ms", "Same-flask cooldown (ms)", "Minimum gap between presses of one flask."),
         ("fails_for_town", "Presses with no effect before town mode", "Lower = pauses sooner in town."),
         ("verify_ms", "Time allowed for a press to work (ms)", "Raise this if town mode turns on by mistake."),
@@ -848,6 +849,19 @@ class SettingsDialog(tk.Toplevel):
                 tk.Label(r, text=help_, bg=PANEL, fg=MUTED, font=SMALL).pack(side="left", padx=10)
             self.num_vars[key] = v
 
+        km = self._section("Key presses")
+        r = tk.Frame(km, bg=PANEL)
+        r.pack(fill="x", pady=3)
+        tk.Label(r, text="How keys are sent", bg=PANEL, fg=TEXT, font=FONT, width=34, anchor="w").pack(side="left")
+        self.method_var = tk.StringVar(value=core.KEY_METHODS[st.get("key_method", "scancode")])
+        ttk.Combobox(r, textvariable=self.method_var, values=list(core.KEY_METHODS.values()), state="readonly",
+                     width=34, style="Dark.TCombobox", font=FONT).pack(side="left")
+        r2 = tk.Frame(km, bg=PANEL)
+        r2.pack(fill="x", pady=(6, 0))
+        button(r2, "Test keys", self._test_keys, font=FONT, pady=3).pack(side="left")
+        tk.Label(r2, text="Presses 1-5 once each in your program so you can check they arrive.",
+                 bg=PANEL, fg=MUTED, font=SMALL).pack(side="left", padx=10)
+
         alerts = self._section("Alerts")
         self.sound = tk.BooleanVar(value=bool(st["sound_alerts"]))
         tk.Checkbutton(alerts, text="Play a sound when town mode starts or stops", variable=self.sound,
@@ -870,6 +884,57 @@ class SettingsDialog(tk.Toplevel):
         inner.pack(fill="x", padx=12, pady=(0, 10))
         return inner
 
+    def _collect(self) -> Optional[dict]:
+        st = {"keys": {k: v.get().strip() for k, v in self.key_vars.items()},
+              "sound_alerts": bool(self.sound.get()),
+              "key_method": next(k for k, v in core.KEY_METHODS.items() if v == self.method_var.get())}
+        for key, v in self.num_vars.items():
+            try:
+                st[key] = int(v.get().strip())
+            except ValueError:
+                self.err.config(text=f"“{v.get()}” isn't a whole number.")
+                return None
+        problems = core.validate_settings(st)
+        if problems:
+            self.err.config(text="\n".join(problems))
+            return None
+        self.err.config(text="")
+        return st
+
+    def _test_keys(self):
+        st = self._collect()
+        if st is None:
+            return
+        cfg = dict(self.cfg)
+        cfg["settings"] = st
+        if not cfg.get("window_title"):
+            messagebox.showwarning(core.APP, "Pick your program window first.", parent=self)
+            return
+        if not messagebox.askokcancel(core.APP, "After you click OK, click into your program. In 3 seconds it "
+                                      "will press your flask keys 1-5, one per second, using the settings above.\n\n"
+                                      "Watch whether each flask is used.", parent=self):
+            return
+        loc = core.WindowLocator(cfg["window_title"], cfg.get("screen_origin", (0, 0)))
+        parent = self.master
+
+        def work():
+            try:
+                sender = core.KeySender(cfg, loc)
+                time.sleep(3)
+                for slot in range(1, 6):
+                    if not loc.is_focused():
+                        parent.log_q.put(f"Test keys: stopped at flask {slot} - your program wasn't focused.")
+                        return
+                    sender(slot, check_focus=False)
+                    parent.log_q.put(f"Test keys: pressed '{st['keys'][str(slot)]}' (flask {slot}).")
+                    time.sleep(1)
+                parent.log_q.put("Test keys finished. If nothing happened in your program, try another "
+                                 "'How keys are sent' option, or run Daniels Assignment as administrator.")
+            except Exception as e:
+                parent.log_q.put(f"Test keys error: {e}")
+
+        threading.Thread(target=work, daemon=True).start()
+
     def _reset(self):
         d = core.DEFAULT_SETTINGS
         for slot, v in self.key_vars.items():
@@ -877,20 +942,12 @@ class SettingsDialog(tk.Toplevel):
         for key, v in self.num_vars.items():
             v.set(str(d[key]))
         self.sound.set(d["sound_alerts"])
+        self.method_var.set(core.KEY_METHODS[d["key_method"]])
         self.err.config(text="")
 
     def _save(self):
-        st = {"keys": {k: v.get().strip() for k, v in self.key_vars.items()},
-              "sound_alerts": bool(self.sound.get())}
-        for key, v in self.num_vars.items():
-            try:
-                st[key] = int(v.get().strip())
-            except ValueError:
-                self.err.config(text=f"“{v.get()}” isn't a whole number.")
-                return
-        problems = core.validate_settings(st)
-        if problems:
-            self.err.config(text="\n".join(problems))
+        st = self._collect()
+        if st is None:
             return
         self.cfg["settings"] = st
         core.save_config(self.cfg)
