@@ -280,7 +280,7 @@ class CalibrationDialog(tk.Toplevel):
         self.steps += [("bar", s) for s in slots if s in core.QUICKSILVER_SLOTS]
         self.i = 0
         self.boxes: Dict[int, List[int]] = {}
-        self.points: Dict[int, Tuple[int, int]] = {}
+        self.points: Dict[int, List[Tuple[int, int]]] = {}
         self.bars: Dict[int, List[int]] = {}
 
         sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
@@ -304,6 +304,7 @@ class CalibrationDialog(tk.Toplevel):
         button(bar, "Cancel", self.destroy, kind="ghost").pack(side="left")
         self.back_btn = button(bar, "◀  Back", self._back)
         self.back_btn.pack(side="left", padx=8)
+        self.undo_btn = button(bar, "Undo click", self._undo_click, kind="ghost")
         self.next_btn = button(bar, "Use this  ▶", self._accept_default, kind="primary")
         self.next_btn.pack(side="right")
 
@@ -315,10 +316,14 @@ class CalibrationDialog(tk.Toplevel):
         self.focus_set()
 
     # -- view helpers -------------------------------------------------------
-    def _set_view(self, region: Tuple[int, int, int, int]) -> None:
-        """Show part of the screenshot (x, y, w, h) scaled to the canvas."""
+    def _set_view(self, region: Tuple[int, int, int, int], overlay: Optional[np.ndarray] = None) -> None:
+        """Show part of the screenshot (x, y, w, h) scaled to the canvas,
+        optionally with a mask shaded pink."""
         x, y, w, h = region
         crop = self.img[y:y + h, x:x + w]
+        if overlay is not None and overlay.any():
+            crop = crop.copy()
+            crop[overlay] = (crop[overlay] * 0.35 + np.array([255, 0, 255]) * 0.65).astype(np.uint8)
         self.view = region
         self.scale = min(self.max_w / w, self.max_h / h, 8.0)
         self._photo = to_photo(crop, int(w * self.scale), int(h * self.scale))
@@ -344,6 +349,10 @@ class CalibrationDialog(tk.Toplevel):
         name = KIND_LABEL[core.SLOT_KINDS[slot]]
         self.step_lbl.config(text=f"Step {self.i + 1} of {len(self.steps)}  ·  Flask {slot} ({name})")
         set_button(self.back_btn, enabled=self.i > 0)
+        if kind == "liquid":
+            self.undo_btn.pack(side="left", padx=8)
+        else:
+            self.undo_btn.pack_forget()
         self._pending_box = None
         old = core.slot_cfg(self.cfg, slot)
 
@@ -359,11 +368,7 @@ class CalibrationDialog(tk.Toplevel):
                               + ("  The orange box is the current one." if existing else ""))
             set_button(self.next_btn, text="Next  ▶", enabled=existing is not None)
         elif kind == "liquid":
-            x, y, w, h = self.boxes[slot]
-            self._set_view((x, y, w, h))
-            self.instr.config(text=f"Click on the {name.lower()} liquid inside flask {slot}.\n"
-                                   "Avoid labels, wings, highlights and glass.")
-            set_button(self.next_btn, text="Next  ▶", enabled=False)
+            self._show_liquid(slot)
         else:  # bar
             x, y, w, h = self.boxes[slot]
             pad = int(h * 0.6)
@@ -381,6 +386,38 @@ class CalibrationDialog(tk.Toplevel):
         if self.i == len(self.steps) - 1 and kind == "bar":
             set_button(self.next_btn, text="Finish  ✓")
 
+    def _liquid(self, slot):
+        x, y, w, h = self.boxes[slot]
+        rel = [(px - x, py - y) for px, py in self.points.get(slot, [])]
+        return core.liquid_mask(self.img[y:y + h, x:x + w], rel)
+
+    def _show_liquid(self, slot):
+        name = KIND_LABEL[core.SLOT_KINDS[slot]].lower()
+        mask = self._liquid(slot)
+        self._set_view(tuple(self.boxes[slot]), overlay=mask)
+        for px, py in self.points.get(slot, []):
+            cx, cy = (px - self.view[0]) * self.scale, (py - self.view[1]) * self.scale
+            self.canvas.create_oval(cx - 5, cy - 5, cx + 5, cy + 5, outline=YELLOW, width=2)
+        share = float(mask.mean())
+        if not self.points.get(slot):
+            text = (f"Click on the {name} liquid inside flask {slot}.\n"
+                    "The liquid it detects turns pink.")
+        elif share < 0.03:
+            text = ("That spot isn't liquid (or it's too small). Click on the liquid itself - "
+                    "use Undo click to remove a wrong click.")
+        else:
+            text = (f"Pink = liquid it will watch ({share:.0%} of the box). If some liquid isn't pink - "
+                    "especially along the TOP edge of the liquid - click it too.\nThen click Next.")
+        self.instr.config(text=text)
+        set_button(self.undo_btn, enabled=bool(self.points.get(slot)))
+        set_button(self.next_btn, text="Next  ▶", enabled=share >= 0.03)
+
+    def _undo_click(self):
+        kind, slot = self.steps[self.i]
+        if kind == "liquid" and self.points.get(slot):
+            self.points[slot].pop()
+            self._show_liquid(slot)
+
     def _fits(self, box) -> bool:
         x, y, w, h = box
         return x >= 0 and y >= 0 and x + w <= self.img.shape[1] and y + h <= self.img.shape[0]
@@ -388,13 +425,8 @@ class CalibrationDialog(tk.Toplevel):
     def _down(self, e):
         kind, slot = self.steps[self.i]
         if kind == "liquid":
-            px, py = self._to_img(e.x, e.y)
-            self.points[slot] = (px, py)
-            self.canvas.delete("dot")
-            self.canvas.create_oval(e.x - 6, e.y - 6, e.x + 6, e.y + 6, outline=YELLOW, width=3, tags="dot")
-            hue = core.hue_at(self.img, (px, py))
-            self.instr.config(text=f"Got it - {core.hue_name(hue)} liquid. Click Next, or click again to change.")
-            set_button(self.next_btn, text="Next  ▶", enabled=True)
+            self.points.setdefault(slot, []).append(self._to_img(e.x, e.y))
+            self._show_liquid(slot)
             return
         self._drag_start = (e.x, e.y)
         self.canvas.delete("sel")
@@ -425,7 +457,7 @@ class CalibrationDialog(tk.Toplevel):
                 return
             self.boxes[slot] = self._pending_box
         elif kind == "liquid":
-            if slot not in self.points:
+            if float(self._liquid(slot).mean()) < 0.03:
                 return
         else:
             self.bars[slot] = self._pending_box

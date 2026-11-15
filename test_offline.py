@@ -109,7 +109,7 @@ sim.town = False; sim.hidden_until = sim.t + 2
 ctl.run(6)
 print("after area change:", [l for l in logs if "TOWN MODE OFF" in l], f"town_mode={ctl.town_mode}")
 assert not ctl.town_mode and len(sim.presses) > n0 + 3
-print("\nALL CHECKS PASSED")
+
 
 # 7. settings: validation, custom keys/timing reach the controller and key sender
 st = da.get_settings({})
@@ -138,4 +138,26 @@ assert rd.read() is not None and rd.size_mismatch is None
 loc.size = (400, 220)
 assert rd.read() is None and rd.size_mismatch == ((400, 220), (322, 181))
 print("settings / resize / town-alert checks passed")
+
+# 9. liquid with uneven colour: one click should cover most of each flask's liquid
+cfg3 = da.default_config()
+da.calibrate_from_image(img, cfg3, boxes, bars, points)
+cfg3 = da.load_config()
+shares = {s["slot"]: da.model_for(s).liquid_share for s in cfg3["slots"]}
+print("liquid share per flask:", {k: f"{v:.0%}" for k, v in shares.items()})
+assert all(v >= 0.12 for v in shares.values()), shares
+# small brightness noise (rendering differences) must not flip FULL off
+rng = np.random.default_rng(0)
+noisy = np.clip(img.astype(int) + rng.integers(-12, 13, img.shape), 0, 255).astype(np.uint8)
+r = da.FlaskReader(cfg3, frame_source=lambda: noisy).read()
+assert all(v.full for v in r.values()), {k: v.top_match for k, v in r.items()}
+# a quicksilver drained to half must read NOT FULL even though its liquid is shaded
+d2 = img.copy()
+m3 = da.model_for(da.slot_cfg(cfg3, 3)); x, y, w, h = boxes[3]
+cut = m3.top + int(0.5 * (m3.bottom - m3.top))
+glass = img[y + 2:y + 6, x + 2:x + 6].reshape(-1, 3).mean(0).astype(np.uint8)
+d2[y:y + cut, x:x + w][m3.mask[:cut]] = glass
+r = da.FlaskReader(cfg3, frame_source=lambda: d2).read()
+assert not r[3].full and r[4].full, (r[3], r[4])
+print("uneven-colour liquid checks passed")
 print("ALL CHECKS PASSED")

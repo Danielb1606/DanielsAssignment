@@ -50,7 +50,7 @@ import cv2
 import numpy as np
 
 APP = "Daniels Assignment"
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 # Saved next to the .exe when packaged (a one-file .exe unpacks itself to a
 # temporary folder, so __file__ would point somewhere that gets deleted).
 _BASE = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
@@ -122,13 +122,8 @@ QUICKSILVER_SLOTS = (3, 4, 5)
 INSTILLING_SLOTS = (1, 2)
 DEFAULT_BAR_RGB = (249, 215, 153)    # measured from your screenshot
 
-HUE_TOL = 12          # OpenCV hue units (0-180)
-LIQ_SAT_MIN = 80      # saturation needed to count as liquid in the reference
-LIQ_VAL_MIN = 45
-LIVE_SAT_MIN = 55     # slightly looser when reading live
-LIVE_VAL_MIN = 35
 TOP_BAND_FRAC = 0.15  # top 15% of the liquid decides "full"
-FULL_MATCH_MIN = 0.60
+FULL_MATCH_MIN = 0.55
 VISIBLE_CORR_MIN = 0.45  # shape match of the non-liquid parts vs the reference
 BAR_RGB_TOL = 40
 BAR_MIN_PIXELS = 4
@@ -329,60 +324,58 @@ class SlotReading:
     top_match: float     # share of the top-of-liquid pixels that still match
 
 
-class SlotModel:
-    """Built from a screenshot of the flask when FULL. Works for any flask
-    art: it learns the liquid colour and where the top of the liquid is."""
+FILL_STEP = 40        # colour change allowed between neighbouring liquid pixels
+FILL_HUE_SPAN = 30    # liquid can drift this far in hue from the clicked spot
+PIX_TOL = 40          # live pixel vs. full-reference pixel tolerance
 
-    def __init__(self, ref_bgr: np.ndarray, liquid_hue: Optional[int] = None,
-                 liquid_point: Optional[Tuple[int, int]] = None):
+
+def liquid_mask(ref_bgr: np.ndarray, points: List[Tuple[int, int]]) -> np.ndarray:
+    """Liquid area found by spreading out from each clicked point (like a
+    paint-bucket fill). It follows gradual shading - light to dark green -
+    but stops at sharp edges and at glass, wings, labels and background."""
+    h, w = ref_bgr.shape[:2]
+    out = np.zeros((h, w), bool)
+    if not points:
+        return out
+    hsv = cv2.cvtColor(ref_bgr, cv2.COLOR_BGR2HSV)
+    H, S, V = (hsv[..., i].astype(int) for i in range(3))
+    for px, py in points:
+        if not (0 <= px < w and 0 <= py < h):
+            continue
+        patch = H[max(0, py - 2):py + 3, max(0, px - 2):px + 3].ravel() * (2 * np.pi / 180)
+        hue0 = int(round((np.arctan2(np.sin(patch).mean(), np.cos(patch).mean()) % (2 * np.pi)) * 180 / (2 * np.pi))) % 180
+        barrier = (S < 45) | (V < 25) | (_circ_hue_dist(H, hue0) > FILL_HUE_SPAN)
+        if barrier[py, px]:
+            continue
+        m = np.zeros((h + 2, w + 2), np.uint8)
+        m[1:-1, 1:-1] = barrier
+        cv2.floodFill(ref_bgr.copy(), m, (int(px), int(py)), 0, (FILL_STEP,) * 3, (FILL_STEP,) * 3,
+                      4 | cv2.FLOODFILL_MASK_ONLY | (2 << 8))
+        out |= m[1:-1, 1:-1] == 2
+    return cv2.morphologyEx(out.astype(np.uint8), cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8)) > 0
+
+
+class SlotModel:
+    """Built from a picture of the flask when FULL plus the spots you clicked
+    on its liquid. FULL = the top of the liquid still looks like it did in
+    that picture, so any flask art and any colour shading works."""
+
+    def __init__(self, ref_bgr: np.ndarray, liquid_points: Optional[List[Tuple[int, int]]] = None):
         self.ref = ref_bgr
         self.h, self.w = ref_bgr.shape[:2]
-        hsv = cv2.cvtColor(ref_bgr, cv2.COLOR_BGR2HSV)
-        H, S, V = hsv[..., 0], hsv[..., 1], hsv[..., 2]
-        coloured = (S >= LIQ_SAT_MIN) & (V >= LIQ_VAL_MIN)
+        self.ref_i = ref_bgr.astype(np.int16)
         self.problems: List[str] = []
+        self.mask = liquid_mask(ref_bgr, liquid_points or [])
+        if not self.mask.any():
+            self.problems.append("no liquid found where you clicked - click on the liquid itself")
 
-        if coloured.sum() < 30:
-            self.hue = 0
-            self.mask = np.zeros_like(coloured)
-            self.problems.append("no coloured liquid found in the box")
+        hsv = cv2.cvtColor(ref_bgr, cv2.COLOR_BGR2HSV)
+        if self.mask.any():
+            ang = hsv[..., 0][self.mask].astype(float) * (2 * np.pi / 180)
+            self.hue = int(round((np.arctan2(np.sin(ang).mean(), np.cos(ang).mean()) % (2 * np.pi))
+                                 * 180 / (2 * np.pi))) % 180
         else:
-            if liquid_hue is not None:
-                self.hue = int(liquid_hue)       # from the click on the liquid
-            else:
-                hist = np.bincount(H[coloured].ravel(), minlength=180).astype(float)
-                hist = np.convolve(np.r_[hist[-4:], hist, hist[:4]], np.ones(9), "valid")
-                self.hue = int(np.argmax(hist))
-            mask = coloured & (_circ_hue_dist(H, self.hue) <= HUE_TOL)
-            mask = cv2.morphologyEx(mask.astype(np.uint8), cv2.MORPH_OPEN, np.ones((2, 2), np.uint8)) > 0
-            n, lab, stats, cents = cv2.connectedComponentsWithStats(mask.astype(np.uint8), 8)
-            keep = np.zeros_like(mask)
-            main = 0
-            if liquid_point is not None:
-                px, py = liquid_point
-                win = lab[max(0, py - 3):py + 4, max(0, px - 3):px + 4]
-                ids = win[win > 0]
-                if ids.size:
-                    main = int(np.bincount(ids).argmax())
-            if main:
-                # the clicked blob, plus big pieces inside its outline (e.g. the
-                # green above and below the quicksilver wings). Anything outside,
-                # like a same-coloured arch or frame, is ignored.
-                x, y, w, h = stats[main, :4]
-                keep |= lab == main
-                for i in range(1, n):
-                    cx, cy = cents[i]
-                    if (i != main and stats[i, cv2.CC_STAT_AREA] >= 0.1 * stats[main, cv2.CC_STAT_AREA]
-                            and x - 3 <= cx <= x + w + 3 and y - h * 0.5 <= cy <= y + h * 1.5):
-                        keep |= lab == i
-            else:
-                total = mask.sum()
-                for i in range(1, n):
-                    if stats[i, cv2.CC_STAT_AREA] >= 0.05 * total:
-                        keep |= lab == i
-                if liquid_point is not None:
-                    self.problems.append("clicked point isn't on the liquid colour; click the liquid itself")
-            self.mask = keep
+            self.hue = 0
 
         rows = self.mask.sum(1)
         if rows.max() == 0:
@@ -400,10 +393,10 @@ class SlotModel:
         self.ref_gray = cv2.cvtColor(ref_bgr, cv2.COLOR_BGR2GRAY).astype(np.int16)
 
         self.liquid_share = float(self.mask.mean())
-        if self.mask.any() and self.liquid_share < 0.08:
-            self.problems.append(f"only {self.liquid_share:.0%} of the box is liquid; "
-                                 "draw the box tighter or check the flask is full")
-        if self.band.sum() < 15:
+        if self.mask.any() and self.liquid_share < 0.05:
+            self.problems.append(f"only {self.liquid_share:.0%} of the box is liquid - "
+                                 "click the parts of the liquid it missed")
+        if self.mask.any() and self.band.sum() < 15:
             self.problems.append("top of the liquid is very small; 'full' may be unreliable")
         if self.frame.sum() < 0.1 * self.frame.size:
             self.problems.append("box has almost no frame/background; visibility check weak")
@@ -419,26 +412,21 @@ class SlotModel:
         return float((a * b).sum() / den) if den > 1e-6 else 0.0
 
     # -- live reading ------------------------------------------------------
-    def liquid_like(self, crop_bgr: np.ndarray) -> np.ndarray:
-        hsv = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2HSV)
-        return ((hsv[..., 1] >= LIVE_SAT_MIN) & (hsv[..., 2] >= LIVE_VAL_MIN)
-                & (_circ_hue_dist(hsv[..., 0], self.hue) <= HUE_TOL))
-
     def read(self, crop_bgr: np.ndarray, bar_crop: Optional[np.ndarray], bar_bgr) -> SlotReading:
         if crop_bgr.shape[:2] != (self.h, self.w):
             crop_bgr = cv2.resize(crop_bgr, (self.w, self.h))
-        ll = self.liquid_like(crop_bgr)
+        same = np.abs(crop_bgr.astype(np.int16) - self.ref_i).max(axis=2) <= PIX_TOL
 
-        top_match = float(ll[self.band].mean()) if self.band.any() else 0.0
+        top_match = float(same[self.band].mean()) if self.band.any() else 0.0
         full = top_match >= FULL_MATCH_MIN
 
         rows = slice(self.top, self.bottom + 1)
         per_row = self.mask[rows].sum(1)
-        hit = (ll & self.mask)[rows].sum(1)
+        hit = (same & self.mask)[rows].sum(1)
         with np.errstate(invalid="ignore", divide="ignore"):
             frac = np.where(per_row > 0, hit / np.maximum(per_row, 1), np.nan)
         valid = ~np.isnan(frac)
-        fill = float((frac[valid] >= 0.4).mean()) if valid.any() else 0.0
+        fill = float((frac[valid] >= 0.5).mean()) if valid.any() else 0.0
 
         gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY).astype(np.int16)
         visible = self.shape_match(gray) >= VISIBLE_CORR_MIN
@@ -451,9 +439,19 @@ class SlotModel:
         return SlotReading(visible, full and visible, active and visible, fill, top_match)
 
 
+def slot_points(s: dict) -> List[Tuple[int, int]]:
+    """Clicked liquid spots for a slot (relative to its box). Older configs
+    stored a single spot as liquid_point."""
+    pts = s.get("liquid_points")
+    if pts:
+        return [tuple(p) for p in pts]
+    if s.get("liquid_point"):
+        return [tuple(s["liquid_point"])]
+    return []
+
+
 def model_for(s: dict) -> SlotModel:
-    pt = s.get("liquid_point")
-    return SlotModel(cv2.imread(str(ref_path(s["slot"]))), s.get("liquid_hue"), tuple(pt) if pt else None)
+    return SlotModel(cv2.imread(str(ref_path(s["slot"]))), slot_points(s))
 
 
 # ================================================================ reader
@@ -761,7 +759,7 @@ def hue_at(img: np.ndarray, point: Tuple[int, int]) -> int:
 
 def calibrate_from_image(img: np.ndarray, cfg: dict, boxes: Dict[int, List[int]],
                          bar_boxes: Dict[int, List[int]],
-                         liquid_points: Optional[Dict[int, Tuple[int, int]]] = None,
+                         liquid_points: Optional[Dict[int, object]] = None,
                          window_size: Optional[Tuple[int, int]] = None) -> List[str]:
     """Save references for the given slots and return the report lines.
     (The interactive calibrate command collects the boxes, then calls this.)"""
@@ -773,13 +771,15 @@ def calibrate_from_image(img: np.ndarray, cfg: dict, boxes: Dict[int, List[int]]
         sc["box"] = box
         if slot in bar_boxes:
             sc["bar_box"] = bar_boxes[slot]
+        sc.pop("liquid_hue", None)
+        sc.pop("liquid_point", None)
         if liquid_points and slot in liquid_points:
-            px, py = liquid_points[slot]
-            sc["liquid_hue"] = hue_at(img, (px, py))
-            sc["liquid_point"] = [px - box[0], py - box[1]]
+            pts = liquid_points[slot]
+            if pts and isinstance(pts[0], (int, np.integer)):     # a single (x, y)
+                pts = [pts]
+            sc["liquid_points"] = [[int(px) - box[0], int(py) - box[1]] for px, py in pts]
         else:
-            sc.pop("liquid_hue", None)
-            sc.pop("liquid_point", None)
+            sc.pop("liquid_points", None)
         cv2.imwrite(str(ref_path(slot)), _crop(img, box))
     save_config(cfg)
     return report(img, cfg, boxes.keys())
@@ -838,12 +838,7 @@ def report(img: np.ndarray, cfg: dict, slots=None) -> List[str]:
         for b, bb in boxes[i + 1:]:
             if not (ba[0] + ba[2] <= bb[0] or bb[0] + bb[2] <= ba[0] or
                     ba[1] + ba[3] <= bb[1] or bb[1] + bb[3] <= ba[1]):
-                lines.append(f"  ! boxes for slot {a} and slot {b} overlap")
-                all_ok = False
-                for r in LAST_REPORT:
-                    if r["slot"] in (a, b):
-                        r["ok"] = False
-                        r["issues"].append(f"box overlaps flask {b if r['slot'] == a else a}'s box")
+                lines.append(f"  (boxes for slot {a} and slot {b} overlap - that's fine)")
 
     lines += ["", "  Magenta = the top-of-liquid area that decides FULL. "
                   "Orange = where it looks for the timer bar.",
