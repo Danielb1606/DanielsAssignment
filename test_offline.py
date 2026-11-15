@@ -366,7 +366,7 @@ class T(One):
         return True
 stt = T(); logs_t = []
 ct = da.FlaskController(stt.read, stt.press, clock=stt.now, sleep=stt.sleep, rng=random.Random(7),
-                        log=logs_t.append, settings=da.get_settings({"settings": {"town_retry_s": 3}}))
+                        log=logs_t.append, settings=da.get_settings({"settings": {"town_retry_secs": 3}}))
 ct.run(6)
 assert ct.town_mode
 n_town = len(stt.presses); stt.town = False; t0 = stt.t
@@ -374,4 +374,22 @@ ct.run(8)
 assert not ct.town_mode, logs_t[-5:]
 left = next(l for l in logs_t if "worked again" in l)
 print("town retry: left town mode ->", left.strip(), f"(presses while in town: {n_town})")
+print("ALL CHECKS PASSED")
+
+# 22. default: in town mode nothing is pressed until a loading screen (belt hidden, then back)
+class L(One):
+    def __init__(s): super().__init__(); s.town = True; s.hidden = False
+    def read(s): return {k: da.SlotReading(not s.hidden, not s.hidden, False, 1.0, 1.0, s.sig[k].copy()) for k in range(1, 6)}
+    def press(s, k):
+        s.presses.append(k)
+        if not s.town and k >= 3: s.sig[k] += 25
+        return True
+sl = L()
+cl = da.FlaskController(sl.read, sl.press, clock=sl.now, sleep=sl.sleep, rng=random.Random(8), log=lambda m: None)
+cl.run(5); assert cl.town_mode
+n = len(sl.presses); cl.run(20)
+assert len(sl.presses) == n, "pressed while in town mode"
+sl.town = False; sl.hidden = True; cl.run(1); sl.hidden = False; cl.run(2)
+assert not cl.town_mode and len(sl.presses) > n
+print("town mode: silent until a loading screen, then resumes")
 print("ALL CHECKS PASSED")

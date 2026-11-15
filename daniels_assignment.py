@@ -57,7 +57,7 @@ RECENT_ERRORS: "collections.deque[str]" = collections.deque(maxlen=20)   # for "
 def note_error(where: str) -> None:
     """Remember the current exception (with its full traceback) for diagnostics."""
     RECENT_ERRORS.append(f"[{time.strftime('%H:%M:%S')}] {where}\n{traceback.format_exc()}")
-__version__ = "1.4.2"
+__version__ = "1.4.3"
 # Saved next to the .exe when packaged (a one-file .exe unpacks itself to a
 # temporary folder, so __file__ would point somewhere that gets deleted).
 _BASE = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
@@ -88,7 +88,7 @@ DEFAULT_SETTINGS = {
     "refire_cooldown_ms": 500,
     "verify_ms": 1200,
     "fails_for_town": 2,
-    "town_retry_s": 3,
+    "town_retry_secs": 0,     # off: town mode ends at the next loading screen (or F9 / using a flask)
     "sound_alerts": True,
     "hotkey_toggle": "f7",
     "hotkey_pause": "f8",
@@ -181,7 +181,7 @@ def validate_settings(st: dict) -> List[str]:
         errs.append("Cooldown must be 0-10000 ms.")
     if not 300 <= st["verify_ms"] <= 10000:
         errs.append("Effect check window must be 300-10000 ms.")
-    if not 0 <= st.get("town_retry_s", 3) <= 120:
+    if not 0 <= st.get("town_retry_secs", 3) <= 120:
         errs.append("Town retry must be 0-120 seconds (0 = off).")
     if not 1 <= st["fails_for_town"] <= 10:
         errs.append("Town mode trigger must be 1-10 presses.")
@@ -849,7 +849,7 @@ class FlaskController:
         self.cooldown = st["refire_cooldown_ms"] / 1000.0
         self.verify_window = st["verify_ms"] / 1000.0
         self.fails_for_town = int(st["fails_for_town"])
-        self.town_retry = float(st.get("town_retry_s", 3))
+        self.town_retry = float(st.get("town_retry_secs", 0))
         self.program_paused = False      # your program is paused (belt dimmed)
         self.probe_slot: Optional[int] = None
         self.last_probe = -1e9
@@ -883,7 +883,7 @@ class FlaskController:
             self.probe_slot = None
             self.last_probe = self.clock()
             self.queue.clear(); self.queued.clear(); self.verify.clear()
-            self.log(f"TOWN MODE ON  - {why}. Not pressing flasks.")
+            self.log(f"TOWN MODE ON  - {why}. Not pressing flasks until the next loading screen.")
             self.on_town(True)
 
     def leave_town(self, why: str) -> None:

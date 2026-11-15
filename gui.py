@@ -807,7 +807,7 @@ class SettingsDialog(tk.Toplevel):
         ("refire_cooldown_ms", "Same-flask cooldown (ms)", "Minimum gap between presses of one flask."),
         ("fails_for_town", "Presses with no effect before town mode", "Lower = pauses sooner in town."),
         ("verify_ms", "Time allowed for a press to work (ms)", "Raise this if town mode turns on by mistake."),
-        ("town_retry_s", "In town mode, retry a quicksilver every (s)", "Ends town mode soon after it's over. 0 = off."),
+        ("town_retry_secs", "In town mode, retry a quicksilver every (s)", "0 = off: wait for a loading screen instead."),
     ]
 
     def __init__(self, parent, cfg: dict, running: bool):
