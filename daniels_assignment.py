@@ -50,7 +50,7 @@ import cv2
 import numpy as np
 
 APP = "Daniels Assignment"
-__version__ = "1.3.1"
+__version__ = "1.3.2"
 # Saved next to the .exe when packaged (a one-file .exe unpacks itself to a
 # temporary folder, so __file__ would point somewhere that gets deleted).
 _BASE = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
@@ -782,17 +782,21 @@ class FlaskController:
         for slot, deadline in list(self.verify.items()):
             if not r[slot].full or r[slot].active or self._changed(slot, r[slot]):
                 self.verify.pop(slot, None)
-                self.fails = 0
-                self.failed_slots.clear()
+                if slot in QUICKSILVER_SLOTS:
+                    self.fails = 0
+                    self.failed_slots.clear()
                 self.wait_refill.add(slot)
             elif now >= deadline:
                 self.verify.pop(slot, None)
                 self.wait_refill.discard(slot)
+                if slot not in QUICKSILVER_SLOTS:
+                    continue      # life/mana can't be drunk at full life/mana - not a sign of town
                 self.fails += 1
                 self.failed_slots.add(slot)
                 self.log(f"[{now:8.3f}] slot {slot}: press had no effect ({self.fails}/{self.fails_for_town})")
-                # a real town stops every flask, so one misbehaving flask isn't enough
-                if self.fails >= self.fails_for_town and len(self.failed_slots) >= 2:
+                # a real town stops every quicksilver, so one misbehaving flask isn't enough
+                usable = sum(1 for q in QUICKSILVER_SLOTS if r[q].visible and r[q].full)
+                if self.fails >= self.fails_for_town and len(self.failed_slots) >= min(2, max(1, usable)):
                     self.enter_town("flasks are not being used")
                     break
 
@@ -817,7 +821,8 @@ class FlaskController:
             return
 
         if not self._quicksilver_running(r, now):
-            for slot in QUICKSILVER_SLOTS:
+            # after a quicksilver didn't respond, try a different one next
+            for slot in sorted(QUICKSILVER_SLOTS, key=lambda q: (q in self.failed_slots, q)):
                 if r[slot].visible and r[slot].full and self._can_schedule(slot, now):
                     self._schedule(slot, now)
                     break

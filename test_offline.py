@@ -102,7 +102,7 @@ sim.refill_at.clear()
 n0 = len(sim.presses)
 ctl.run(10)
 print("town:", [l for l in logs if "TOWN" in l], f"presses in town: {len(sim.presses) - n0}")
-assert ctl.town_mode and len(sim.presses) - n0 <= 3
+assert ctl.town_mode and len(sim.presses) - n0 <= 8   # two quicksilver tries, plus life/mana retries
 
 # leave town via loading screen
 sim.town = False; sim.hidden_until = sim.t + 2
@@ -245,4 +245,22 @@ c2 = da.FlaskController(sim2.read, sim2.press, clock=sim2.now, sleep=sim2.sleep,
 c2.run(4)
 assert c2.town_mode
 print("every flask unresponsive: town mode")
+print("ALL CHECKS PASSED")
+
+# 16. full life/mana that can't be drunk never cause town mode; quicksilvers alone decide
+sim3 = One()
+def press3(k):
+    sim3.presses.append(k)
+    if k >= 3: sim3.sig[k] += 20; return True      # quicksilvers work
+    return True                                      # life/mana do nothing (full life/mana)
+sim3.press = press3; logs3 = []
+c3 = da.FlaskController(sim3.read, sim3.press, clock=sim3.now, sleep=sim3.sleep, rng=random.Random(4), log=logs3.append)
+c3.run(8)
+assert not c3.town_mode and sim3.presses.count(1) >= 2, (sim3.presses, logs3[-3:])
+print("life/mana unusable at full: no town mode, still retried")
+sim4 = One(); sim4.press = lambda k: (sim4.presses.append(k), True)[1]
+c4 = da.FlaskController(sim4.read, sim4.press, clock=sim4.now, sleep=sim4.sleep, rng=random.Random(4), log=lambda m: None)
+c4.run(6)
+assert c4.town_mode and len({k for k in sim4.presses if k >= 3}) >= 2, sim4.presses
+print("quicksilvers unresponsive (rotating between them): town mode")
 print("ALL CHECKS PASSED")
