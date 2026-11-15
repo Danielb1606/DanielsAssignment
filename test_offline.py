@@ -110,3 +110,32 @@ ctl.run(6)
 print("after area change:", [l for l in logs if "TOWN MODE OFF" in l], f"town_mode={ctl.town_mode}")
 assert not ctl.town_mode and len(sim.presses) > n0 + 3
 print("\nALL CHECKS PASSED")
+
+# 7. settings: validation, custom keys/timing reach the controller and key sender
+st = da.get_settings({})
+assert st["keys"]["3"] == "3" and not da.validate_settings(st)
+bad = da.get_settings({"settings": {"keys": {"1": "1", "2": "1"}, "delay_min_ms": 400, "delay_max_ms": 100}})
+errs = da.validate_settings(bad)
+assert any("different key" in e for e in errs) and any("min must be" in e for e in errs), errs
+custom = da.get_settings({"settings": {"delay_min_ms": 200, "delay_max_ms": 250, "fails_for_town": 3}})
+c = da.FlaskController(lambda: None, lambda s: True, settings=custom)
+assert c.delay_range == (0.2, 0.25) and c.fails_for_town == 3
+town_events = []
+c.on_town = town_events.append
+c.enter_town("x"); c.leave_town("y")
+assert town_events == [True, False]
+
+# 8. resize: reader reports nothing (so nothing is pressed) when the window size changed
+class Loc:
+    size = (322, 181)
+    def client_size(self): return self.size
+    def origin(self): return (0, 0)
+class Grab:
+    def grab(self, l, t, w, h): return img[t:t + h, l:l + w]
+cfg2 = da.load_config(); cfg2["window_size"] = [322, 181]
+loc = Loc(); rd = da.FlaskReader(cfg2, loc, Grab())
+assert rd.read() is not None and rd.size_mismatch is None
+loc.size = (400, 220)
+assert rd.read() is None and rd.size_mismatch == ((400, 220), (322, 181))
+print("settings / resize / town-alert checks passed")
+print("ALL CHECKS PASSED")

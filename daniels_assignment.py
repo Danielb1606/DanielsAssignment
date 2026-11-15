@@ -50,7 +50,7 @@ import cv2
 import numpy as np
 
 APP = "Daniels Assignment"
-__version__ = "1.0.1"
+__version__ = "1.1.0"
 # Saved next to the .exe when packaged (a one-file .exe unpacks itself to a
 # temporary folder, so __file__ would point somewhere that gets deleted).
 _BASE = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
@@ -66,6 +66,55 @@ REFIRE_COOLDOWN = 0.5                # min gap between presses of the same slot
 VERIFY_WINDOW = 1.2                  # time for a press to show an effect
 FAILS_FOR_TOWN = 2                   # presses with no effect before town mode
 HIDDEN_POLLS_FOR_AREA_CHANGE = 2     # belt hidden this many checks = area change
+
+# Everything above can be changed in the app's Settings panel; these are the defaults.
+DEFAULT_SETTINGS = {
+    "keys": {"1": "1", "2": "2", "3": "3", "4": "4", "5": "5"},
+    "checks_per_second": 4,
+    "delay_min_ms": 150,
+    "delay_max_ms": 300,
+    "key_hold_ms": 30,
+    "refire_cooldown_ms": 500,
+    "verify_ms": 1200,
+    "fails_for_town": 2,
+    "sound_alerts": True,
+}
+
+
+def get_settings(cfg: dict) -> dict:
+    out = json.loads(json.dumps(DEFAULT_SETTINGS))
+    saved = cfg.get("settings", {})
+    for k, v in saved.items():
+        if k == "keys" and isinstance(v, dict):
+            out["keys"].update({str(a): str(b) for a, b in v.items()})
+        elif k in out:
+            out[k] = v
+    return out
+
+
+def validate_settings(st: dict) -> List[str]:
+    """Problems with a settings dict (empty list = OK)."""
+    errs = []
+    keys = st["keys"]
+    for slot in "12345":
+        k = str(keys.get(slot, "")).strip()
+        if len(k) != 1:
+            errs.append(f"Flask {slot} key must be a single key (e.g. 1 or q).")
+    if len({str(keys.get(s, "")).lower() for s in "12345"}) < 5:
+        errs.append("Each flask needs a different key.")
+    if not 1 <= st["checks_per_second"] <= 20:
+        errs.append("Checks per second must be between 1 and 20.")
+    if not 0 <= st["delay_min_ms"] <= st["delay_max_ms"] <= 5000:
+        errs.append("Press delay: min must be ≤ max (0-5000 ms).")
+    if not 5 <= st["key_hold_ms"] <= 500:
+        errs.append("Key hold must be 5-500 ms.")
+    if not 0 <= st["refire_cooldown_ms"] <= 10000:
+        errs.append("Cooldown must be 0-10000 ms.")
+    if not 300 <= st["verify_ms"] <= 10000:
+        errs.append("Effect check window must be 300-10000 ms.")
+    if not 1 <= st["fails_for_town"] <= 10:
+        errs.append("Town mode trigger must be 1-10 presses.")
+    return errs
 
 # ---------------------------------------------------------------- detection
 SLOT_KINDS = {1: "life", 2: "mana", 3: "quicksilver", 4: "quicksilver", 5: "quicksilver"}
@@ -195,6 +244,17 @@ class WindowLocator:
         self.user32.ShowWindow(hwnd, 9)          # SW_RESTORE
         self.user32.SetForegroundWindow(hwnd)
         return True
+
+    def client_size(self) -> Optional[Tuple[int, int]]:
+        """Inner size of your program's window (None = unknown)."""
+        if not (self.win and self.title):
+            return None
+        hwnd = self.find()
+        if not hwnd:
+            return None
+        r = self.wintypes.RECT()
+        self.user32.GetClientRect(hwnd, self.ctypes.byref(r))
+        return (r.right, r.bottom)
 
     def origin(self) -> Optional[Tuple[int, int]]:
         """Screen position of the window's client area (None = not found)."""
@@ -419,6 +479,8 @@ class FlaskReader:
         self.bx1 = max(b[0] + b[2] for b in boxes)
         self.by1 = max(b[1] + b[3] for b in boxes)
         self.last_crops: Dict[int, Tuple[np.ndarray, Optional[np.ndarray]]] = {}
+        self.expected_size = tuple(cfg["window_size"]) if cfg.get("window_size") else None
+        self.size_mismatch: Optional[Tuple[Tuple[int, int], Tuple[int, int]]] = None
 
     def _region(self) -> Optional[np.ndarray]:
         if self.frame_source is not None:
@@ -431,6 +493,14 @@ class FlaskReader:
         return self.grabber.grab(ox + self.bx0, oy + self.by0, self.bx1 - self.bx0, self.by1 - self.by0)
 
     def read(self) -> Optional[Dict[int, SlotReading]]:
+        # If the window was resized since calibration the boxes no longer line
+        # up: report nothing (so nothing gets pressed) and flag it for the app.
+        if self.frame_source is None and self.expected_size and self.locator:
+            size = self.locator.client_size()
+            if size and tuple(size) != self.expected_size:
+                self.size_mismatch = (tuple(size), self.expected_size)
+                return None
+        self.size_mismatch = None
         region = self._region()
         if region is None:
             return None
@@ -460,8 +530,16 @@ class FlaskController:
                  clock: Callable[[], float] = time.monotonic,
                  sleep: Callable[[float], None] = time.sleep,
                  rng: Optional[random.Random] = None,
-                 log: Callable[[str], None] = print):
+                 log: Callable[[str], None] = print,
+                 settings: Optional[dict] = None):
         self.read, self.press = read, press
+        st = settings or DEFAULT_SETTINGS
+        self.poll_interval = 1.0 / float(st["checks_per_second"])
+        self.delay_range = (st["delay_min_ms"] / 1000.0, st["delay_max_ms"] / 1000.0)
+        self.cooldown = st["refire_cooldown_ms"] / 1000.0
+        self.verify_window = st["verify_ms"] / 1000.0
+        self.fails_for_town = int(st["fails_for_town"])
+        self.on_town: Callable[[bool], None] = lambda on: None
         self.clock, self.sleep = clock, sleep
         self.rng = rng or random.Random()
         self.log = log
@@ -485,12 +563,14 @@ class FlaskController:
             self.belt_hidden_in_town = False
             self.queue.clear(); self.queued.clear(); self.verify.clear()
             self.log(f"TOWN MODE ON  - {why}. Not pressing flasks.")
+            self.on_town(True)
 
     def leave_town(self, why: str) -> None:
         if self.town_mode:
             self.town_mode = False
             self.fails = 0
             self.log(f"TOWN MODE OFF - {why}.")
+            self.on_town(False)
 
     # -- one check -----------------------------------------------------------
     def poll(self) -> None:
@@ -517,15 +597,15 @@ class FlaskController:
             elif now >= deadline:
                 self.verify.pop(slot, None)
                 self.fails += 1
-                self.log(f"[{now:8.3f}] slot {slot}: press had no effect ({self.fails}/{FAILS_FOR_TOWN})")
-                if self.fails >= FAILS_FOR_TOWN:
+                self.log(f"[{now:8.3f}] slot {slot}: press had no effect ({self.fails}/{self.fails_for_town})")
+                if self.fails >= self.fails_for_town:
                     self.enter_town("flasks are not being used")
                     break
 
         # a flask emptied without us pressing it = flasks work again
         for slot, rd in r.items():
             was_full = self.prev_full.get(slot)
-            recently = now - self.last_press.get(slot, -1e9) < VERIFY_WINDOW + 0.5
+            recently = now - self.last_press.get(slot, -1e9) < self.verify_window + 0.5
             if was_full and not rd.full and rd.visible and not recently and self.town_mode:
                 self.leave_town(f"slot {slot} was used manually")
             self.prev_full[slot] = rd.full
@@ -553,10 +633,10 @@ class FlaskController:
     def _can_schedule(self, slot: int, now: float) -> bool:
         if slot in self.queued or slot in self.verify:
             return False
-        return now - self.last_press.get(slot, -1e9) >= REFIRE_COOLDOWN
+        return now - self.last_press.get(slot, -1e9) >= self.cooldown
 
     def _schedule(self, slot: int, now: float) -> None:
-        delay = self.rng.uniform(*INPUT_DELAY_RANGE)
+        delay = self.rng.uniform(*self.delay_range)
         heapq.heappush(self.queue, _Pending(now + delay, slot))
         self.queued.add(slot)
         self.log(f"[{now:8.3f}] slot {slot} full -> press in {delay * 1000:.0f} ms")
@@ -570,7 +650,7 @@ class FlaskController:
                 continue
             if self.press(p.slot):
                 self.last_press[p.slot] = now
-                self.verify[p.slot] = now + VERIFY_WINDOW
+                self.verify[p.slot] = now + self.verify_window
                 self.log(f"[{now:8.3f}] pressed {p.slot}")
             else:
                 self.log(f"[{now:8.3f}] skipped {p.slot} (your program's window isn't focused)")
@@ -584,9 +664,9 @@ class FlaskController:
                 break
             if now >= next_poll:
                 self.poll()
-                next_poll += POLL_INTERVAL
+                next_poll += self.poll_interval
                 if next_poll < now:                 # fell behind; don't burst
-                    next_poll = now + POLL_INTERVAL
+                    next_poll = now + self.poll_interval
             self._fire_due()
             wake = next_poll if not self.queue else min(next_poll, self.queue[0].fire_at)
             self.sleep(max(0.0, wake - self.clock()))
@@ -597,7 +677,9 @@ class KeySender:
     def __init__(self, cfg: dict, locator: WindowLocator):
         from pynput.keyboard import Controller
         self.kb = Controller()
-        self.keys = {s["slot"]: s["key"] for s in cfg["slots"]}
+        st = get_settings(cfg)
+        self.keys = {s["slot"]: st["keys"][str(s["slot"])] for s in cfg["slots"]}
+        self.hold = st["key_hold_ms"] / 1000.0
         self.locator = locator
 
     def __call__(self, slot: int) -> bool:
@@ -605,7 +687,7 @@ class KeySender:
             return False
         k = self.keys[slot]
         self.kb.press(k)
-        time.sleep(KEY_HOLD)
+        time.sleep(self.hold)
         self.kb.release(k)
         return True
 
@@ -679,10 +761,13 @@ def hue_at(img: np.ndarray, point: Tuple[int, int]) -> int:
 
 def calibrate_from_image(img: np.ndarray, cfg: dict, boxes: Dict[int, List[int]],
                          bar_boxes: Dict[int, List[int]],
-                         liquid_points: Optional[Dict[int, Tuple[int, int]]] = None) -> List[str]:
+                         liquid_points: Optional[Dict[int, Tuple[int, int]]] = None,
+                         window_size: Optional[Tuple[int, int]] = None) -> List[str]:
     """Save references for the given slots and return the report lines.
     (The interactive calibrate command collects the boxes, then calls this.)"""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+    if window_size:
+        cfg["window_size"] = list(window_size)
     for slot, box in boxes.items():
         sc = slot_cfg(cfg, slot)
         sc["box"] = box
@@ -792,6 +877,8 @@ def cmd_calibrate(args) -> None:
         img, origin = ScreenGrabber().grab_window_or_screen(locator)
         if not (cfg["window_title"] and locator.win):
             cfg["screen_origin"] = list(origin)
+        else:
+            cfg["window_size"] = [img.shape[1], img.shape[0]]
         print(" " * 30)
 
     slots = [args.slot] if args.slot else [1, 2, 3, 4, 5]
@@ -903,7 +990,7 @@ def cmd_run(args) -> None:
         raise SystemExit("Set your program's window title first:  calibrate --window \"<title>\"")
     locator = WindowLocator(cfg["window_title"], cfg.get("screen_origin", (0, 0)))
     reader = FlaskReader(cfg, locator, ScreenGrabber())
-    ctl = FlaskController(reader.read, KeySender(cfg, locator))
+    ctl = FlaskController(reader.read, KeySender(cfg, locator), settings=get_settings(cfg))
 
     from pynput import keyboard
 

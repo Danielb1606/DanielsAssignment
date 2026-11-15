@@ -6,13 +6,22 @@ It creates `dist\DanielsAssignment.exe`. Copy it anywhere and double-click it.
 Calibration is saved in a `daniels_assignment_data` folder next to the .exe.
 
 ## Using it
+A setup guide at the top walks you through the first run:
 1. **Program window** - pick your program from the list (⟳ refreshes it).
 2. **Calibrate all flasks** - with every flask full: drag a box around each flask,
    click its liquid, then accept or redraw the timer-bar boxes for the quicksilvers.
-   A results screen shows what's working.
-3. **Recalibrate** under any flask redoes just that one (e.g. new or bigger art).
-4. **Test mode** - each card shows FULL / NOT FULL / RUNNING live. Nothing is pressed.
-5. **Start** - runs it. F8 pause/resume, F9 leave town mode, F10 stop.
+3. **Test mode** - each card shows FULL / NOT FULL / RUNNING live. Nothing is pressed.
+4. **Start** - F8 pause/resume, F9 leave town mode, F10 stop.
+
+Also:
+- **Recalibrate** under any flask redoes just that one (e.g. new or bigger art).
+- **Settings** - flask keys, checks per second, press delay, key hold, cooldown,
+  town-mode sensitivity, sound alerts.
+- **Compact** - a small always-on-top bar with five status dots, start/stop and ⤢ to
+  return to the full window. Drag it by the ⠿ handle; it remembers where you put it.
+- If your program's window changes size after calibration, an orange warning appears
+  and nothing is pressed until you resize it back or recalibrate.
+- Town mode plays a sound and flashes the status when it starts or stops.
 
 ## Auto-update
 Releases come from https://github.com/Danielb1606/DanielsAssignment/releases.
