@@ -50,7 +50,14 @@ import cv2
 import numpy as np
 
 APP = "Daniels Assignment"
-__version__ = "1.3.4"
+import collections, traceback
+RECENT_ERRORS: "collections.deque[str]" = collections.deque(maxlen=20)   # for "Report a problem"
+
+
+def note_error(where: str) -> None:
+    """Remember the current exception (with its full traceback) for diagnostics."""
+    RECENT_ERRORS.append(f"[{time.strftime('%H:%M:%S')}] {where}\n{traceback.format_exc()}")
+__version__ = "1.4.0"
 # Saved next to the .exe when packaged (a one-file .exe unpacks itself to a
 # temporary folder, so __file__ would point somewhere that gets deleted).
 _BASE = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
@@ -81,7 +88,47 @@ DEFAULT_SETTINGS = {
     "verify_ms": 1200,
     "fails_for_town": 2,
     "sound_alerts": True,
+    "hotkey_toggle": "f7",
+    "hotkey_pause": "f8",
+    "hotkey_town": "f9",
 }
+HOTKEY_NAMES = {"hotkey_toggle": "Start / stop", "hotkey_pause": "Pause / resume", "hotkey_town": "Leave town mode"}
+MODIFIERS = ("ctrl", "alt", "shift")
+
+
+def vk_to_name(vk: int) -> Optional[str]:
+    """Windows virtual-key code -> hotkey key name."""
+    if 65 <= vk <= 90:
+        return chr(vk).lower()
+    if 48 <= vk <= 57:
+        return chr(vk)
+    if 112 <= vk <= 123:
+        return f"f{vk - 111}"
+    if 96 <= vk <= 105:
+        return f"num{vk - 96}"
+    return {32: "space", 9: "tab", 13: "enter", 8: "backspace", 45: "insert", 46: "delete", 36: "home",
+            35: "end", 33: "page_up", 34: "page_down", 37: "left", 38: "up", 39: "right", 40: "down",
+            192: "`", 189: "-", 187: "=", 219: "[", 221: "]", 220: "\\", 186: ";", 222: "'", 188: ",",
+            190: ".", 191: "/"}.get(vk)
+
+
+def normalize_hotkey(text: str) -> str:
+    """'Shift + E' / 'shift+e' / 'F7' -> 'shift+e' / 'f7' (modifiers in a fixed order). '' = none."""
+    if not text or str(text).strip().lower() in ("none", ""):
+        return ""
+    parts = [p.strip().lower() for p in str(text).replace(" ", "").split("+") if p.strip()]
+    mods = [m for m in MODIFIERS if m in parts]
+    keys = [p for p in parts if p not in MODIFIERS]
+    if len(keys) != 1:
+        return ""
+    return "+".join(mods + keys)
+
+
+def hotkey_label(combo: str) -> str:
+    if not combo:
+        return "None"
+    nice = {"ctrl": "Ctrl", "alt": "Alt", "shift": "Shift"}
+    return " + ".join(nice.get(p, p.upper() if len(p) <= 3 else p.replace("_", " ").title()) for p in combo.split("+"))
 
 
 KEY_METHODS = {"scancode": "Hardware scan code (most compatible)",
@@ -95,6 +142,8 @@ def get_settings(cfg: dict) -> dict:
     for k, v in saved.items():
         if k == "keys" and isinstance(v, dict):
             out["keys"].update({str(a): str(b) for a, b in v.items()})
+        elif k in HOTKEY_NAMES:
+            out[k] = normalize_hotkey(v)
         elif k in out:
             out[k] = v
     return out
@@ -116,6 +165,14 @@ def validate_settings(st: dict) -> List[str]:
         errs.append("Press delay: min must be ≤ max (0-5000 ms).")
     if not 5 <= st["key_hold_min_ms"] <= st["key_hold_max_ms"] <= 1000:
         errs.append("Key hold: min must be ≤ max (5-1000 ms).")
+    hks = [normalize_hotkey(st.get(k, "")) for k in HOTKEY_NAMES]
+    used = [h for h in hks if h]
+    if len(used) != len(set(used)):
+        errs.append("Each hotkey needs a different key combination.")
+    flask_keys = {str(st["keys"].get(s_, "")).lower() for s_ in "12345"}
+    for name, h in zip(HOTKEY_NAMES.values(), hks):
+        if h and h in flask_keys:
+            errs.append(f"{name} hotkey is the same as a flask key - add a modifier (e.g. Shift).")
     if st.get("key_method") not in KEY_METHODS:
         errs.append("Unknown key sending method.")
     if not 0 <= st["refire_cooldown_ms"] <= 10000:
@@ -291,9 +348,28 @@ class ScreenGrabber:
             self._local.sct = self._mss.mss()
         return self._local.sct
 
+    def _reset(self):
+        sct = getattr(self._local, "sct", None)
+        if sct is not None:
+            try:
+                sct.close()
+            except Exception:
+                pass
+            del self._local.sct
+
     def grab(self, left: int, top: int, width: int, height: int) -> np.ndarray:
-        shot = self._sct().grab({"left": left, "top": top, "width": width, "height": height})
+        region = {"left": left, "top": top, "width": width, "height": height}
+        try:
+            shot = self._sct().grab(region)
+        except Exception:
+            # Windows screen capture can go stale (e.g. after the app stopped
+            # and started again) - start a fresh capture and try once more
+            self._reset()
+            shot = self._sct().grab(region)
         return np.ascontiguousarray(np.array(shot)[:, :, :3])
+
+    def close(self):
+        self._reset()
 
     def grab_window_or_screen(self, locator: WindowLocator) -> Tuple[np.ndarray, Tuple[int, int]]:
         """Whole client area of your window (or the whole desktop)."""
@@ -694,6 +770,7 @@ class FlaskReader:
         self.by1 = max(b[1] + b[3] for b in boxes)
         self.last_crops: Dict[int, Tuple[np.ndarray, Optional[np.ndarray]]] = {}
         self.expected_size = tuple(cfg["window_size"]) if cfg.get("window_size") else None
+        self.problem = ""          # why the last read returned nothing (shown in the app)
         self.size_mismatch: Optional[Tuple[Tuple[int, int], Tuple[int, int]]] = None
 
     def _region(self) -> Optional[np.ndarray]:
@@ -713,11 +790,19 @@ class FlaskReader:
             size = self.locator.client_size()
             if size and tuple(size) != self.expected_size:
                 self.size_mismatch = (tuple(size), self.expected_size)
+                self.problem = "window resized"
                 return None
         self.size_mismatch = None
-        region = self._region()
-        if region is None:
+        try:
+            region = self._region()
+        except Exception as e:
+            note_error("screen capture")
+            self.problem = f"screen capture failed ({e.__class__.__name__})"
             return None
+        if region is None:
+            self.problem = "window not found"
+            return None
+        self.problem = ""
         out = {}
         for s in self.cfg["slots"]:
             x, y, w, h = s["box"]
@@ -911,7 +996,14 @@ class FlaskController:
             if duration is not None and now - start >= duration:
                 break
             if now >= next_poll:
-                self.poll()
+                try:
+                    self.poll()
+                except Exception as e:           # keep going; report once per kind of error
+                    note_error("controller check")
+                    msg = f"Error while reading the flasks: {e}"
+                    if msg != getattr(self, "_last_error", None):
+                        self._last_error = msg
+                        self.log(msg)
                 next_poll += self.poll_interval
                 if next_poll < now:                 # fell behind; don't burst
                     next_poll = now + self.poll_interval
@@ -921,6 +1013,80 @@ class FlaskController:
 
 
 # ================================================================ keyboard
+class HotkeyListener:
+    """Watches the keyboard everywhere (also while your program has focus)
+    and calls on_hotkey(setting_name) when a configured combination is pressed."""
+
+    def __init__(self, settings: dict, on_hotkey: Callable[[str], None]):
+        self.on_hotkey = on_hotkey
+        self.paused = False                  # e.g. while recording a new hotkey
+        self.mods: set = set()
+        self.listener = None
+        self.update(settings)
+
+    def update(self, settings: dict) -> None:
+        self.combos = {normalize_hotkey(settings.get(k, "")): k for k in HOTKEY_NAMES}
+        self.combos.pop("", None)
+
+    def start(self) -> bool:
+        try:
+            from pynput import keyboard
+        except Exception:
+            return False
+        self._kb = keyboard
+        self.listener = keyboard.Listener(on_press=self._press, on_release=self._release)
+        self.listener.daemon = True
+        self.listener.start()
+        return True
+
+    def stop(self) -> None:
+        if self.listener:
+            self.listener.stop()
+            self.listener = None
+
+    def _mod(self, key) -> Optional[str]:
+        K = self._kb.Key
+        if key in (K.shift, K.shift_l, K.shift_r):
+            return "shift"
+        if key in (K.ctrl, K.ctrl_l, K.ctrl_r):
+            return "ctrl"
+        if key in (K.alt, K.alt_l, K.alt_r, getattr(K, "alt_gr", K.alt)):
+            return "alt"
+        return None
+
+    def _name(self, key) -> Optional[str]:
+        vk = getattr(key, "vk", None)
+        if vk is None and hasattr(key, "value"):
+            vk = getattr(key.value, "vk", None)
+        if vk is not None:
+            n = vk_to_name(int(vk))
+            if n:
+                return n
+        if hasattr(key, "name") and key.name:
+            return key.name.lower()
+        ch = getattr(key, "char", None)
+        return ch.lower() if ch else None
+
+    def _press(self, key):
+        m = self._mod(key)
+        if m:
+            self.mods.add(m)
+            return
+        if self.paused:
+            return
+        name = self._name(key)
+        if not name:
+            return
+        combo = "+".join([x for x in MODIFIERS if x in self.mods] + [name])
+        if combo in self.combos:
+            self.on_hotkey(self.combos[combo])
+
+    def _release(self, key):
+        m = self._mod(key)
+        if m:
+            self.mods.discard(m)
+
+
 class KeySender:
     """Presses a flask key like a real keyboard would.
 
@@ -1001,6 +1167,61 @@ class KeySender:
             time.sleep(hold)
             self.kb.release(k)
         return True
+
+
+# ================================================================ diagnostics
+def write_report(dest_dir: Path, log_text: str, engine_state: dict) -> Path:
+    """Bundle everything useful for debugging into one zip file."""
+    import platform, zipfile, io
+    cfg = load_config()
+    info = {"app_version": __version__, "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "windows": platform.platform(), "python": sys.version.split()[0],
+            "packaged": bool(getattr(sys, "frozen", False)), "engine": engine_state,
+            "settings": get_settings(cfg)}
+    loc = WindowLocator(cfg.get("window_title", ""), cfg.get("screen_origin", (0, 0)))
+    win = {"title_setting": cfg.get("window_title", ""), "calibrated_size": cfg.get("window_size")}
+    try:
+        win["found"] = bool(loc.find()) if loc.win and loc.title else None
+        win["origin"] = loc.origin()
+        win["client_size"] = loc.client_size()
+        win["focused"] = loc.is_focused()
+        win["open_windows"] = loc.list_titles()[:40]
+    except Exception:
+        note_error("window info")
+    info["window"] = win
+    pictures = {}
+    try:
+        cap = ScreenGrabber()
+        try:
+            img, _ = cap.grab_window_or_screen(loc)
+            pictures["window_now.png"] = img
+        except SystemExit as e:
+            info["window"]["capture"] = str(e.code)
+        try:
+            r = FlaskReader(cfg, loc, cap)
+            readings = r.read()
+            info["reading_now"] = ({k: {"visible": v.visible, "full": v.full, "running": v.active,
+                                        "fill": round(v.fill, 2), "top_match": round(v.top_match, 2)}
+                                    for k, v in readings.items()} if readings else {"problem": r.problem})
+        except SystemExit as e:
+            info["reading_now"] = {"problem": str(e.code)}
+        cap.close()
+    except Exception:
+        note_error("report capture")
+    info["calibration"] = {k: v for k, v in cfg.items() if k != "settings"}
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    path = dest_dir / f"DanielsAssignment-report-{time.strftime('%Y%m%d-%H%M%S')}.zip"
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("info.json", json.dumps(info, indent=2, default=str))
+        z.writestr("activity_log.txt", log_text)
+        z.writestr("errors.txt", "\n\n".join(RECENT_ERRORS) or "(no errors recorded)")
+        for name, im in pictures.items():
+            ok, png = cv2.imencode(".png", im)
+            if ok:
+                z.writestr(name, png.tobytes())
+        for f in DATA_DIR.glob("*.png"):
+            z.write(f, f"data/{f.name}")
+    return path
 
 
 # ================================================================ calibration

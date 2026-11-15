@@ -289,3 +289,31 @@ for clicks in ([(27, 70)], [(27, 70), (14, 53), (19, 44), (22, 41), (24, 40), (3
     assert int((obvious & ~m).sum()) < 0.01 * obvious.sum(), int((obvious & ~m).sum())
 print("mana edges: no grey glass at any setting; loose setting gets the blue edge")
 print("ALL CHECKS PASSED")
+
+# 19. hotkeys: names, modifiers, conflicts, matching while modifiers are held
+assert da.normalize_hotkey("Shift + E") == "shift+e" and da.normalize_hotkey("e+ctrl+shift") == "ctrl+shift+e"
+assert da.normalize_hotkey("F7") == "f7" and da.normalize_hotkey("None") == ""
+assert da.hotkey_label("ctrl+shift+e") == "Ctrl + Shift + E" and da.hotkey_label("f7") == "F7"
+st = da.get_settings({})
+assert (st["hotkey_toggle"], st["hotkey_pause"], st["hotkey_town"]) == ("f7", "f8", "f9")
+bad = dict(st); bad["hotkey_pause"] = "f7"
+assert any("different key" in e for e in da.validate_settings(bad))
+bad = dict(st); bad["hotkey_toggle"] = "1"
+assert any("same as a flask key" in e for e in da.validate_settings(bad))
+ok = dict(st); ok["hotkey_toggle"] = "shift+1"
+assert not da.validate_settings(ok)
+class _K:                                  # stand-in for pynput's Key / KeyCode
+    def __init__(s, name=None, vk=None): s.name, s.vk, s.char = name, vk, None
+class _Keys:
+    shift = _K("shift"); shift_l = _K("shift_l"); shift_r = _K("shift_r"); ctrl = _K("ctrl"); ctrl_l = _K("ctrl_l")
+    ctrl_r = _K("ctrl_r"); alt = _K("alt"); alt_l = _K("alt_l"); alt_r = _K("alt_r"); alt_gr = _K("alt_gr")
+class _KB: Key = _Keys
+hits = []
+hl = da.HotkeyListener(dict(st, hotkey_toggle="shift+e"), hits.append); hl._kb = _KB
+hl._press(_K(vk=69)); assert hits == []                                  # plain E: nothing
+hl._press(_Keys.shift_l); hl._press(_K(vk=69)); hl._release(_Keys.shift_l)
+assert hits == ["hotkey_toggle"], hits                                   # Shift+E
+hl._press(_K(vk=119)); assert hits[-1] == "hotkey_pause"                 # F8
+hl.paused = True; hl._press(_K(vk=120)); assert hits[-1] == "hotkey_pause"   # ignored while recording
+print("hotkeys: Shift+E style combos, defaults F7/F8/F9, conflict checks ok")
+print("ALL CHECKS PASSED")

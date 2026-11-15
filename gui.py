@@ -154,47 +154,39 @@ class Engine:
             self.controller.on_town = lambda on: self.log_q.put("__TOWN_ON__" if on else "__TOWN_OFF__")
             target = self._run_loop
             args = ()
-            self._start_hotkeys()
         self.thread = threading.Thread(target=target, args=args, daemon=True)
         self.thread.start()
 
+    def _close_capture(self, reader) -> None:
+        g = getattr(reader, "grabber", None)
+        if g is not None and hasattr(g, "close"):
+            try:
+                g.close()                # release this thread's screen capture
+            except Exception:
+                pass
+
     def _test_loop(self, reader) -> None:
+        last_err = None
         while not self.stop_flag.is_set():
             try:
                 self._read_and_store(reader)
             except Exception as e:      # keep the UI alive
-                self.log(f"Read error: {e}")
+                core.note_error("test loop")
+                if str(e) != last_err:
+                    last_err = str(e)
+                    self.log(f"Read error: {e}")
             time.sleep(self.poll_interval)
+        self._close_capture(reader)
 
     def _run_loop(self) -> None:
-        self.log("Started. F8 pause/resume, F9 leave town mode, F10 stop.")
+        self.log("Started.")
         try:
             self.controller.run()
         except Exception as e:
+            core.note_error("run loop")
             self.log(f"Stopped because of an error: {e}")
+        self._close_capture(self.reader)
         self.log("Stopped.")
-
-    def _start_hotkeys(self) -> None:
-        try:
-            from pynput import keyboard
-        except Exception:
-            return
-
-        def on_press(key):
-            c = self.controller
-            if not c or self.mode != "run":
-                return
-            if key == keyboard.Key.f8:
-                c.paused = not c.paused
-                self.log("Paused." if c.paused else "Resumed.")
-            elif key == keyboard.Key.f9:
-                c.leave_town("F9 pressed")
-            elif key == keyboard.Key.f10:
-                self.log_q.put("__STOP__")
-
-        self.hotkeys = keyboard.Listener(on_press=on_press)
-        self.hotkeys.daemon = True
-        self.hotkeys.start()
 
     def stop(self) -> None:
         self.stop_flag.set()
@@ -202,9 +194,6 @@ class Engine:
             self.controller.running = False
         if self.thread and self.thread.is_alive():
             self.thread.join(timeout=2)
-        if self.hotkeys:
-            self.hotkeys.stop()
-            self.hotkeys = None
         self.thread = None
         self.controller = None
         self.reader = None
@@ -849,6 +838,22 @@ class SettingsDialog(tk.Toplevel):
                 tk.Label(r, text=help_, bg=PANEL, fg=MUTED, font=SMALL).pack(side="left", padx=10)
             self.num_vars[key] = v
 
+        hk = self._section("Hotkeys (work while your program is focused too)")
+        self.hk_vals = {k: st[k] for k in core.HOTKEY_NAMES}
+        self.hk_lbls = {}
+        self._recording = None
+        for key, name in core.HOTKEY_NAMES.items():
+            r = tk.Frame(hk, bg=PANEL)
+            r.pack(fill="x", pady=3)
+            tk.Label(r, text=name, bg=PANEL, fg=TEXT, font=FONT, width=34, anchor="w").pack(side="left")
+            lbl = tk.Label(r, text=core.hotkey_label(self.hk_vals[key]), bg=PANEL_2, fg=TEXT,
+                           font=("Segoe UI Semibold", 10), width=16, pady=3)
+            lbl.pack(side="left")
+            self.hk_lbls[key] = lbl
+            button(r, "Change", lambda k=key: self._record(k), font=SMALL, pady=3).pack(side="left", padx=(8, 4))
+            button(r, "Clear", lambda k=key: self._set_hotkey(k, ""), kind="ghost", font=SMALL, pady=3).pack(side="left")
+        self.bind("<KeyPress>", self._on_key)
+
         km = self._section("Key presses")
         r = tk.Frame(km, bg=PANEL)
         r.pack(fill="x", pady=3)
@@ -884,10 +889,43 @@ class SettingsDialog(tk.Toplevel):
         inner.pack(fill="x", padx=12, pady=(0, 10))
         return inner
 
+    # -- hotkey recording ---------------------------------------------------
+    def _record(self, key):
+        self._recording = key
+        for k, l in self.hk_lbls.items():
+            l.config(text=core.hotkey_label(self.hk_vals[k]), bg=PANEL_2)
+        self.hk_lbls[key].config(text="Press keys…", bg=GOLD, fg="#1a140c")
+        self.focus_set()
+
+    def _set_hotkey(self, key, combo):
+        self.hk_vals[key] = combo
+        self.hk_lbls[key].config(text=core.hotkey_label(combo), bg=PANEL_2, fg=TEXT)
+        self._recording = None
+
+    def _on_key(self, e):
+        if not self._recording:
+            return
+        if e.keysym in ("Shift_L", "Shift_R", "Control_L", "Control_R", "Alt_L", "Alt_R", "Meta_L", "Meta_R",
+                        "Caps_Lock", "Win_L", "Win_R", "Super_L", "Super_R"):
+            return "break"                       # wait for the main key
+        if e.keysym == "Escape":
+            self._set_hotkey(self._recording, self.hk_vals[self._recording])
+            return "break"
+        import sys as _sys
+        win = _sys.platform == "win32"
+        name = core.vk_to_name(e.keycode) if win else None
+        if not name:
+            name = e.keysym.lower() if len(e.keysym) > 1 else e.keysym.lower()
+        alt_mask = 0x20000 if win else 0x8
+        mods = [m for m, bit in (("ctrl", 0x4), ("alt", alt_mask), ("shift", 0x1)) if e.state & bit]
+        self._set_hotkey(self._recording, "+".join(mods + [name]))
+        return "break"
+
     def _collect(self) -> Optional[dict]:
         st = {"keys": {k: v.get().strip() for k, v in self.key_vars.items()},
               "sound_alerts": bool(self.sound.get()),
               "key_method": next(k for k, v in core.KEY_METHODS.items() if v == self.method_var.get())}
+        st.update(self.hk_vals)
         for key, v in self.num_vars.items():
             try:
                 st[key] = int(v.get().strip())
@@ -943,6 +981,8 @@ class SettingsDialog(tk.Toplevel):
             v.set(str(d[key]))
         self.sound.set(d["sound_alerts"])
         self.method_var.set(core.KEY_METHODS[d["key_method"]])
+        for k in core.HOTKEY_NAMES:
+            self._set_hotkey(k, d[k])
         self.err.config(text="")
 
     def _save(self):
@@ -1050,6 +1090,11 @@ class App(tk.Tk):
         self._build()
         self.refresh_cards_idle()
         self.after(250, self._tick)
+        self.hotkeys = core.HotkeyListener(core.get_settings(self.cfg),
+                                           lambda name: self.log_q.put("__HK__" + name))
+        if not self.hotkeys.start():
+            self.write_log("Hotkeys unavailable on this computer.")
+        self._update_hotkey_hint()
         self._update_info = None
         if updater.is_packaged() and updater.UPDATE_REPO:
             threading.Thread(target=self._check_update, daemon=True).start()
@@ -1083,6 +1128,8 @@ class App(tk.Tk):
         self.status = tk.Label(head, text="●  Idle", bg=PANEL_2, fg=MUTED, font=H_FONT, padx=14, pady=5)
         self.status.pack(side="right")
         button(head, "▭  Compact", self.enter_compact, font=FONT, padx=10, pady=5).pack(side="right", padx=(0, 10))
+        button(head, "Report a problem", self.report_problem, kind="ghost", font=SMALL, padx=8, pady=5).pack(
+            side="right", padx=(0, 8))
         button(head, "⚙  Settings", self.open_settings, font=FONT, padx=10, pady=5).pack(side="right", padx=(0, 8))
 
         # update banner (hidden until an update is found)
@@ -1153,6 +1200,8 @@ class App(tk.Tk):
                               padx=26, pady=9)
         self.run_btn.pack(side="right")
         self.pause_btn.pack(side="right", padx=8)
+        self.hk_hint = tk.Label(self, text="", bg=BG, fg=MUTED, font=SMALL, anchor="e")
+        self.hk_hint.pack(fill="x", padx=24, pady=(0, 2), after=ctl)
 
         # log
         logf = tk.Frame(self, bg=PANEL, highlightthickness=1, highlightbackground=BORDER)
@@ -1322,10 +1371,14 @@ class App(tk.Tk):
 
     # -- settings / compact ----------------------------------------------------
     def open_settings(self):
+        self.hotkeys.paused = True
         dlg = SettingsDialog(self, self.cfg, running=self.engine.mode != "idle")
         self.wait_window(dlg)
+        self.hotkeys.paused = False
         if dlg.saved:
             self.cfg = core.load_config()
+            self.hotkeys.update(core.get_settings(self.cfg))
+            self._update_hotkey_hint()
             st = core.get_settings(self.cfg)
             keys = " ".join(st["keys"][k] for k in "12345")
             self.write_log(f"Settings saved (keys {keys}, delay {st['delay_min_ms']}-{st['delay_max_ms']} ms, "
@@ -1365,8 +1418,10 @@ class App(tk.Tk):
             r = self.engine.latest
             crops = dict(self.engine.crops)
         if r is None:
+            why = (self.engine.reader.problem if self.engine.reader is not None else "") or "starting…"
+            label = {"window not found": "NO WINDOW", "window resized": "RESIZED"}.get(why, "CAN'T READ")
             for card in self.cards.values():
-                card.set_state("NO WINDOW", ORANGE, "program not found", None)
+                card.set_state(label, ORANGE, why, None)
             return
         for slot, rd in r.items():
             card = self.cards[slot]
@@ -1467,6 +1522,52 @@ class App(tk.Tk):
                 messagebox.showerror(core.APP, self.engine.error)
         self._update_buttons()
 
+    def report_problem(self):
+        c = self.engine.controller
+        state = {"mode": self.engine.mode, "error": self.engine.error,
+                 "reader_problem": getattr(self.engine.reader, "problem", None),
+                 "has_latest_reading": self.engine.latest is not None,
+                 "thread_alive": bool(self.engine.thread and self.engine.thread.is_alive()),
+                 "town_mode": getattr(c, "town_mode", None), "paused": getattr(c, "paused", None),
+                 "resized_flag": self._resized}
+        self.write_log("Making a problem report…")
+        self.update_idletasks()
+        try:
+            path = core.write_report(core.DATA_DIR.parent, self.log.get("1.0", "end"), state)
+        except Exception as e:
+            core.note_error("report")
+            messagebox.showerror(core.APP, f"Couldn't make the report: {e}")
+            return
+        self.write_log(f"Report saved: {path}")
+        messagebox.showinfo(core.APP, f"Saved a problem report:\n\n{path}\n\n"
+                                      "Send this file to Claude. It contains your settings, the activity log, "
+                                      "recent errors and a picture of your program's window.")
+        try:
+            import subprocess, sys as _sys
+            if _sys.platform == "win32":
+                subprocess.Popen(["explorer", "/select,", str(path)])
+        except Exception:
+            pass
+
+    def _hotkey(self, name: str):
+        if name == "hotkey_toggle":
+            if self.engine.mode == "test":
+                self.toggle_test()
+            if self.engine.mode == "run" or self.can_start():
+                self.toggle_run()
+                self.write_log("Started (hotkey)." if self.engine.mode == "run" else "Stopped (hotkey).")
+            else:
+                self.write_log("Hotkey: can't start yet - " + self.guide_hint.cget("text"))
+        elif name == "hotkey_pause" and self.engine.mode == "run":
+            self._toggle_pause()
+        elif name == "hotkey_town" and self.engine.mode == "run":
+            self._leave_town()
+
+    def _update_hotkey_hint(self):
+        st = core.get_settings(self.cfg)
+        parts = [f"{core.hotkey_label(st[k])} {label.lower()}" for k, label in core.HOTKEY_NAMES.items() if st[k]]
+        self.hk_hint.config(text="   ·   ".join(parts) if parts else "No hotkeys set")
+
     def _toggle_pause(self):
         c = self.engine.controller
         if c:
@@ -1513,6 +1614,8 @@ class App(tk.Tk):
                                                  "Check your internet connection and try again.")
             elif msg in ("__TOWN_ON__", "__TOWN_OFF__"):
                 self._alert(msg == "__TOWN_ON__")
+            elif msg.startswith("__HK__"):
+                self._hotkey(msg[6:])
             else:
                 self.write_log(msg)
         mode = self.engine.mode
@@ -1617,6 +1720,7 @@ class App(tk.Tk):
         threading.Thread(target=work, daemon=True).start()
 
     def _close(self):
+        self.hotkeys.stop()
         self.engine.stop()
         if self.mini is not None:
             self.mini.destroy()

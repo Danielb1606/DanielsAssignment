@@ -13,7 +13,8 @@ A setup guide at the top walks you through the first run:
    pink = the liquid it will watch, dashed yellow = timer-bar area. Click **Finish** if it's
    right, or click a flask to fix just that one (box, liquid click and Similarity slider).
 3. **Test mode** - each card shows FULL / NOT FULL / RUNNING live. Nothing is pressed.
-4. **Start** - F8 pause/resume, F9 leave town mode, F10 stop.
+4. **Start** - default hotkeys: F7 start/stop, F8 pause/resume, F9 leave town mode (change them in Settings).
+   Something wrong? Click **Report a problem** and send the file it saves.
 
 Also:
 - **Recalibrate** under any flask redoes just that one (e.g. new or bigger art).
