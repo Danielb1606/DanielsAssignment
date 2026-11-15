@@ -50,7 +50,7 @@ import cv2
 import numpy as np
 
 APP = "Daniels Assignment"
-__version__ = "1.2.1"
+__version__ = "1.3.0"
 # Saved next to the .exe when packaged (a one-file .exe unpacks itself to a
 # temporary folder, so __file__ would point somewhere that gets deleted).
 _BASE = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
@@ -507,6 +507,128 @@ def slot_points(s: dict) -> List[Tuple[int, int]]:
 def model_for(s: dict) -> SlotModel:
     return SlotModel(cv2.imread(str(ref_path(s["slot"]))), slot_points(s),
                      s.get("similarity", DEFAULT_SIMILARITY), s.get("pick_mode", "shape"))
+
+
+# ================================================================ auto-detection
+AUTO_PREV_MIN = 0.8        # how closely a saved flask must match to be reused
+
+
+def _colour_candidates(mask: np.ndarray, img_shape) -> List[dict]:
+    ih, iw = img_shape[:2]
+    m = cv2.morphologyEx(mask.astype(np.uint8), cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
+    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))   # join pieces split by art
+    n, lab, st, _ = cv2.connectedComponentsWithStats(m, 8)
+    out = []
+    for i in range(1, n):
+        x, y, w, h, a = (int(v) for v in st[i])
+        if a < 120 or w > 0.3 * iw or h > 0.6 * ih or w < 8 or h < 12:
+            continue                                   # specks, health/mana globes, etc.
+        if not 0.6 <= h / w <= 5 or a / (w * h) < 0.25:
+            continue
+        comp = (lab == i).astype(np.uint8)
+        dist = cv2.distanceTransform(comp, cv2.DIST_L2, 3)
+        py, px = np.unravel_index(int(np.argmax(dist)), dist.shape)   # deepest point in the liquid
+        out.append({"x": x, "y": y, "w": w, "h": h, "a": a, "cx": x + w / 2, "cy": y + h / 2,
+                    "point": (int(px), int(py))})
+    return out
+
+
+def _detect_by_colour(img: np.ndarray) -> Dict[int, dict]:
+    """Red, blue and three evenly spaced green liquids in a row."""
+    import itertools
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    H, S, V = (hsv[..., i].astype(int) for i in range(3))
+    sat = (S >= 90) & (V >= 45)
+    cands = {
+        "life": _colour_candidates(sat & ((H <= 10) | (H >= 170)), img.shape),
+        "mana": _colour_candidates(sat & (H >= 100) & (H <= 130), img.shape),
+        "quicksilver": _colour_candidates(sat & (H >= 40) & (H <= 90), img.shape),
+    }
+    best = None
+    greens = sorted(cands["quicksilver"], key=lambda d: d["cx"])
+    for a, b, c in itertools.combinations(greens, 3):
+        p1, p2 = b["cx"] - a["cx"], c["cx"] - b["cx"]
+        hs = [a["h"], b["h"], c["h"]]
+        if p1 <= 0 or p2 <= 0 or abs(p1 - p2) > 0.2 * max(p1, p2) or max(hs) > 1.4 * min(hs):
+            continue
+        if max(abs(a["cy"] - b["cy"]), abs(b["cy"] - c["cy"])) > 0.3 * max(hs):
+            continue
+        pitch = (p1 + p2) / 2
+        if pitch < 0.8 * max(a["w"], b["w"], c["w"]):
+            continue
+        score = -abs(p1 - p2) - float(np.std(hs))
+        if best is None or score > best[0]:
+            best = (score, [a, b, c], pitch)
+    if not best:
+        return {}
+    _, qs, pitch = best
+    liquids = {3: qs[0], 4: qs[1], 5: qs[2]}
+    for slot, kind, k in ((2, "mana", 1), (1, "life", 2)):
+        tx = qs[0]["cx"] - k * pitch
+        near = [d for d in cands[kind]
+                if abs(d["cx"] - tx) < 0.4 * pitch and abs(d["cy"] - qs[0]["cy"]) < 0.8 * qs[0]["h"]]
+        if near:
+            liquids[slot] = max(near, key=lambda d: d["a"])
+
+    # liquid -> whole-bottle box (neck above, base below), one shared row height
+    ih, iw = img.shape[:2]
+    top = min(d["y"] - 0.6 * d["h"] for d in liquids.values())
+    bottom = max(d["y"] + d["h"] * 1.15 for d in liquids.values())
+    y0, y1 = max(0, int(top)), min(ih, int(round(bottom)))
+    w = int(round(pitch * 0.92))
+    out = {}
+    for slot, d in liquids.items():
+        x0 = max(0, min(iw - w, int(round(d["cx"] - w / 2))))
+        out[slot] = {"box": [x0, y0, w, y1 - y0], "point": d["point"], "source": "colour",
+                     "confidence": 0.8}
+    return out
+
+
+def auto_detect(img: np.ndarray, cfg: dict) -> Dict[int, dict]:
+    """Best guess for every flask: {slot: {box, point (image coords), similarity,
+    mode, bar_box, source, confidence, unsure}}. Uses your saved calibration
+    first (if the flasks look the same), then colour detection."""
+    found: Dict[int, dict] = {}
+    for s in cfg["slots"]:
+        p = ref_path(s["slot"])
+        if not (s.get("box") and p.exists()):
+            continue
+        ref = cv2.imread(str(p))
+        if ref is None or ref.shape[0] > img.shape[0] or ref.shape[1] > img.shape[1]:
+            continue
+        res = cv2.matchTemplate(img, ref, cv2.TM_CCOEFF_NORMED)
+        _, score, _, (mx, my) = cv2.minMaxLoc(res)
+        if score >= AUTO_PREV_MIN:
+            box = [int(mx), int(my), ref.shape[1], ref.shape[0]]
+            pts = slot_points(s)
+            entry = {"box": box, "point": (mx + pts[0][0], my + pts[0][1]) if pts else None,
+                     "points": [(mx + px, my + py) for px, py in pts],
+                     "similarity": s.get("similarity", DEFAULT_SIMILARITY), "mode": s.get("pick_mode", "shape"),
+                     "source": "previous", "confidence": float(score)}
+            if s.get("bar_box"):
+                ob = s["box"]
+                b = s["bar_box"]
+                entry["bar_box"] = [mx + b[0] - ob[0], my + b[1] - ob[1], b[2], b[3]]
+            found[s["slot"]] = entry
+
+    if len(found) < 5:
+        for slot, d in _detect_by_colour(img).items():
+            if slot not in found:
+                found[slot] = d
+
+    for slot, d in found.items():
+        d.setdefault("points", [d["point"]] if d.get("point") else [])
+        d.setdefault("similarity", DEFAULT_SIMILARITY)
+        d.setdefault("mode", "shape")
+        if slot in QUICKSILVER_SLOTS and not d.get("bar_box"):
+            d["bar_box"] = default_bar_box(d["box"])
+        # unsure if the liquid it would pick looks too small
+        x, y, w, h = d["box"]
+        rel = [(px - x, py - y) for px, py in d["points"]]
+        share = float(liquid_selection(img[y:y + h, x:x + w], rel, d["similarity"], d["mode"]).mean()) if rel else 0
+        d["liquid_share"] = share
+        d["unsure"] = d["confidence"] < 0.75 or share < 0.05
+    return found
 
 
 # ================================================================ reader

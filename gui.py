@@ -270,9 +270,10 @@ class CalibrationDialog(tk.Toplevel):
     """Step-by-step: box each flask, pick its liquid with a click + Similarity
     slider, let the app find quicksilvers 4 and 5, then the timer strips."""
 
-    def __init__(self, parent, img: np.ndarray, cfg: dict, slots: List[int]):
+    def __init__(self, parent, img: np.ndarray, cfg: dict, slots: List[int], preset: Optional[dict] = None):
         super().__init__(parent, bg=BG)
         self.title(f"{core.APP} | Calibration")
+        self.preset = preset or {}
         self.transient(parent)
         self.grab_set()
         self.img, self.cfg, self.slots = img, cfg, slots
@@ -297,6 +298,12 @@ class CalibrationDialog(tk.Toplevel):
             self.liq[s] = {"similarity": int(sc.get("similarity", core.DEFAULT_SIMILARITY)) if keep_old
                            else core.DEFAULT_SIMILARITY,
                            "mode": sc.get("pick_mode", "shape") if keep_old else "shape"}
+            if s in self.preset:                       # start from the auto-detected guess
+                pr = self.preset[s]
+                self.liq[s] = {"similarity": int(pr.get("similarity", core.DEFAULT_SIMILARITY)),
+                               "mode": pr.get("mode", "shape")}
+                if pr.get("points"):
+                    self.points[s] = [tuple(p) for p in pr["points"]]
         self.bars: Dict[int, List[int]] = {}
         self.found: List[List[int]] = []
 
@@ -416,7 +423,8 @@ class CalibrationDialog(tk.Toplevel):
             self._set_view((0, 0, self.img.shape[1], self.img.shape[0]))
             for s, b in self.boxes.items():
                 self._draw_box(b, GREEN, label=str(s))
-            existing = old["box"] if old["box"] and self._fits(old["box"]) else None
+            guess = self.preset.get(slot, {}).get("box")
+            existing = self.boxes.get(slot) or guess or (old["box"] if old["box"] and self._fits(old["box"]) else None)
             self._pending_box = existing
             if existing:
                 self._draw_box(existing, ORANGE, dash=(4, 3), tag="sel")
@@ -451,7 +459,8 @@ class CalibrationDialog(tk.Toplevel):
             vh = min(self.img.shape[0] - vy, h + pad + 10)
             self._set_view((vx, vy, vw, vh))
             self._draw_box(self.boxes[slot], GREEN)
-            prev = old["bar_box"] if (old["bar_box"] and len(self.slots) == 1) else None
+            prev = self.bars.get(slot) or self.preset.get(slot, {}).get("bar_box") or \
+                (old["bar_box"] if (old["bar_box"] and len(self.slots) == 1) else None)
             if prev is None and slot != 3 and 3 in self.bars and 3 in self.boxes:
                 # same position under the flask as flask 3's bar
                 b3, bx3 = self.bars[3], self.boxes[3]
@@ -585,6 +594,151 @@ class CalibrationDialog(tk.Toplevel):
         if self.i > 0:
             self.i -= 1
             self._render()
+
+
+# ================================================================ review (auto-detected)
+class ReviewDialog(tk.Toplevel):
+    """Shows what auto-detection found for all five flasks. Finish if it's
+    right; click a flask (or its Fix button) to correct just that one."""
+
+    def __init__(self, parent, img: np.ndarray, cfg: dict, detected: Dict[int, dict]):
+        super().__init__(parent, bg=BG)
+        self.title(f"{core.APP} | Calibration")
+        self.transient(parent)
+        self.grab_set()
+        self.img, self.cfg = img, cfg
+        self.entries: Dict[int, dict] = {k: dict(v) for k, v in detected.items()}
+        self.result = None
+        self.manual = False
+
+        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+        self.max_w, self.max_h = min(1280, sw - 120), min(600, sh - 330)
+
+        top = tk.Frame(self, bg=BG)
+        top.pack(fill="x", padx=16, pady=(14, 6))
+        tk.Label(top, text="Check the flasks", bg=BG, fg=GOLD, font=TITLE_FONT).pack(anchor="w")
+        self.instr = tk.Label(top, text="", bg=BG, fg=TEXT, font=("Segoe UI", 12), justify="left", wraplength=900)
+        self.instr.pack(anchor="w", pady=(2, 0))
+
+        self.canvas = tk.Canvas(self, bg="#0c0a08", highlightthickness=0, cursor="hand2")
+        self.canvas.pack(padx=16, pady=6)
+        self.canvas.bind("<ButtonPress-1>", self._click)
+
+        self.row = tk.Frame(self, bg=BG)
+        self.row.pack(fill="x", padx=16, pady=(2, 4))
+        self.fix_btns: Dict[int, tk.Label] = {}
+        for slot in range(1, 6):
+            b = button(self.row, "", lambda s=slot: self.fix(s), font=FONT, padx=10, pady=4)
+            b.pack(side="left", padx=(0, 8))
+            self.fix_btns[slot] = b
+
+        bar = tk.Frame(self, bg=BG)
+        bar.pack(fill="x", padx=16, pady=(6, 14))
+        button(bar, "Cancel", self.destroy, kind="ghost").pack(side="left")
+        button(bar, "Do it step by step instead", self._manual, kind="ghost").pack(side="left", padx=8)
+        self.finish_btn = button(bar, "Looks right - Finish  ✓", self._finish, kind="primary")
+        self.finish_btn.pack(side="right")
+        self._render()
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+        self.focus_set()
+
+    def _status(self, slot):
+        e = self.entries.get(slot)
+        if not e:
+            return "missing"
+        return "unsure" if e.get("unsure") else "ok"
+
+    def _render(self):
+        h, w = self.img.shape[:2]
+        boxes = [e["box"] for e in self.entries.values()] + \
+                [e["bar_box"] for e in self.entries.values() if e.get("bar_box")]
+        if boxes and len(self.entries) == 5:   # zoom to the flask belt with some margin
+            x0 = max(0, min(b[0] for b in boxes) - 40); y0 = max(0, min(b[1] for b in boxes) - 30)
+            x1 = min(w, max(b[0] + b[2] for b in boxes) + 40); y1 = min(h, max(b[1] + b[3] for b in boxes) + 30)
+        else:
+            x0, y0, x1, y1 = 0, 0, w, h
+        self.view = (x0, y0, x1 - x0, y1 - y0)
+        view = self.img[y0:y1, x0:x1].copy()
+        for slot, e in self.entries.items():
+            bx, by, bw, bh = e["box"]
+            rel = [(px - bx, py - by) for px, py in e.get("points", [])]
+            m = core.liquid_selection(self.img[by:by + bh, bx:bx + bw], rel, e["similarity"], e["mode"])
+            sub = view[by - y0:by - y0 + bh, bx - x0:bx - x0 + bw]
+            mm = m[:sub.shape[0], :sub.shape[1]]
+            sub[mm] = (sub[mm] * 0.35 + np.array([255, 0, 255]) * 0.65).astype(np.uint8)
+        self.scale = min(self.max_w / view.shape[1], self.max_h / view.shape[0], 6.0)
+        self._photo = to_photo(view, int(view.shape[1] * self.scale), int(view.shape[0] * self.scale))
+        self.canvas.config(width=self._photo.width(), height=self._photo.height())
+        self.canvas.delete("all")
+        self.canvas.create_image(0, 0, image=self._photo, anchor="nw")
+        sc = self.scale
+        for slot, e in self.entries.items():
+            col = ORANGE if e.get("unsure") else GREEN
+            bx, by, bw, bh = e["box"]
+            self.canvas.create_rectangle((bx - x0) * sc, (by - y0) * sc, (bx + bw - x0) * sc, (by + bh - y0) * sc,
+                                         outline=col, width=3 if e.get("unsure") else 2)
+            self.canvas.create_text((bx - x0) * sc + 6, (by - y0) * sc + 4, anchor="nw", text=str(slot),
+                                    fill=col, font=("Segoe UI Semibold", 13))
+            if e.get("bar_box"):
+                bx, by, bw, bh = e["bar_box"]
+                self.canvas.create_rectangle((bx - x0) * sc, (by - y0) * sc, (bx + bw - x0) * sc,
+                                             (by + bh - y0) * sc, outline=YELLOW, width=1, dash=(3, 2))
+
+        missing = [s for s in range(1, 6) if self._status(s) == "missing"]
+        unsure = [s for s in range(1, 6) if self._status(s) == "unsure"]
+        for slot, b in self.fix_btns.items():
+            st = self._status(slot)
+            label = {"ok": f"✓  Flask {slot}", "unsure": f"?  Check flask {slot}",
+                     "missing": f"+  Draw flask {slot}"}[st]
+            b.config(text=label, fg={"ok": GREEN, "unsure": ORANGE, "missing": RED}[st])
+        if missing:
+            text = (f"Couldn't find flask{'s' if len(missing) > 1 else ''} {', '.join(map(str, missing))} - "
+                    "click its button below to draw it.")
+        elif unsure:
+            text = (f"Found all five. Please check flask{'s' if len(unsure) > 1 else ''} "
+                    f"{', '.join(map(str, unsure))} (orange). Pink = the liquid it will watch; dashed yellow = "
+                    "where it reads the timer bar. Click any flask to fix it.")
+        else:
+            text = ("Found all five. Pink = the liquid it will watch; dashed yellow = where it reads the timer bar. "
+                    "If it all looks right, click Finish. Otherwise click the flask to fix it.")
+        self.instr.config(text=text)
+        set_button(self.finish_btn, enabled=not missing)
+
+    def _click(self, e):
+        x0, y0 = self.view[0], self.view[1]
+        ix, iy = x0 + e.x / self.scale, y0 + e.y / self.scale
+        for slot, en in self.entries.items():
+            bx, by, bw, bh = en["box"]
+            if bx <= ix <= bx + bw and by <= iy <= by + bh:
+                self.fix(slot)
+                return
+
+    def fix(self, slot: int):
+        preset = {slot: self.entries[slot]} if slot in self.entries else {}
+        dlg = CalibrationDialog(self, self.img, self.cfg, [slot], preset=preset)
+        self.wait_window(dlg)
+        if not dlg.result:
+            return
+        boxes, bars, points, liq = dlg.result
+        self.entries[slot] = {"box": boxes[slot], "points": points.get(slot, []),
+                              "similarity": liq[slot]["similarity"], "mode": liq[slot]["mode"],
+                              "bar_box": bars.get(slot) if slot in core.QUICKSILVER_SLOTS else None,
+                              "unsure": False, "source": "you"}
+        self._render()
+
+    def _manual(self):
+        self.manual = True
+        self.destroy()
+
+    def _finish(self):
+        if any(self._status(s) == "missing" for s in range(1, 6)):
+            return
+        boxes = {s: e["box"] for s, e in self.entries.items()}
+        bars = {s: e["bar_box"] for s, e in self.entries.items() if s in core.QUICKSILVER_SLOTS and e.get("bar_box")}
+        points = {s: e.get("points", []) for s, e in self.entries.items()}
+        liq = {s: {"similarity": e["similarity"], "mode": e["mode"]} for s, e in self.entries.items()}
+        self.result = (boxes, bars, points, liq)
+        self.destroy()
 
 
 # ================================================================ report dialog
@@ -1202,12 +1356,23 @@ class App(tk.Tk):
         img = self._capture()
         if img is None:
             return
-        dlg = CalibrationDialog(self, img, self.cfg, slots)
-        self.wait_window(dlg)
+        detected = core.auto_detect(img, self.cfg)
+        if len(slots) == 5:
+            dlg = ReviewDialog(self, img, self.cfg, detected)
+            self.wait_window(dlg)
+            if dlg.manual:                               # "Do it step by step instead"
+                dlg = CalibrationDialog(self, img, self.cfg, slots)
+                self.wait_window(dlg)
+        else:
+            preset = {slots[0]: detected[slots[0]]} if slots[0] in detected else {}
+            dlg = CalibrationDialog(self, img, self.cfg, slots, preset=preset)
+            self.wait_window(dlg)
         if not dlg.result:
             self.write_log("Calibration cancelled.")
             return
         boxes, bars, points, liq = dlg.result
+        found = sum(1 for d in detected.values() if not d.get("unsure"))
+        self.write_log(f"Auto-detection found {len(detected)} of 5 flasks ({found} confidently).")
         loc = self._locator()
         size = (img.shape[1], img.shape[0]) if (self.cfg.get("window_title") and loc.win) else None
         core.calibrate_from_image(img, self.cfg, boxes, bars, points, liquid_settings=liq, window_size=size)

@@ -8,10 +8,10 @@ Calibration is saved in a `daniels_assignment_data` folder next to the .exe.
 ## Using it
 A setup guide at the top walks you through the first run:
 1. **Program window** - pick your program from the list (⟳ refreshes it).
-2. **Calibrate all flasks** - with every flask full: drag a box around flasks 1-3, click
-   each one's liquid and slide **Similarity** until the pink covers the liquid. The app then
-   finds quicksilvers 4 and 5 for you (same settings as flask 3). Accept or redraw the
-   timer-bar boxes.
+2. **Calibrate all flasks** - with every flask full. The app finds all five flasks by itself
+   (or reuses your last calibration if they look the same) and shows a review screen:
+   pink = the liquid it will watch, dashed yellow = timer-bar area. Click **Finish** if it's
+   right, or click a flask to fix just that one (box, liquid click and Similarity slider).
 3. **Test mode** - each card shows FULL / NOT FULL / RUNNING live. Nothing is pressed.
 4. **Start** - F8 pause/resume, F9 leave town mode, F10 stop.
 

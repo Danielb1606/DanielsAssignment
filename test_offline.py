@@ -197,3 +197,28 @@ rows = np.nonzero(q.any(1))[0]
 assert rows.min() < 50 and rows.max() > 95, (rows.min(), rows.max())   # above AND below the wings
 print("pick modes ok; quicksilver liquid rows", rows.min(), "-", rows.max())
 print("ALL CHECKS PASSED")
+
+# 13. auto-detection: colour detection finds all five, boxes contain the right flasks
+for path in [sys.argv[1] if len(sys.argv) > 1 else "flasks.png"]:
+    raw = cv2.imread(path)
+    det = da.auto_detect(raw, da.default_config())
+    assert sorted(det) == [1, 2, 3, 4, 5], det.keys()
+    for s_, (bx, by, bw, bh) in boxes.items():
+        dx, dy, dw, dh = det[s_]["box"]
+        cx = dx + dw / 2
+        assert bx <= cx <= bx + bw, (s_, det[s_]["box"], boxes[s_])          # centred on the right flask
+        assert not det[s_]["unsure"] and det[s_]["liquid_share"] > 0.1, (s_, det[s_])
+print("auto-detect (colour): all five found")
+
+# 14. reuse of the saved calibration when the window moved
+da.calibrate_from_image(img, da.default_config(), boxes, bars, points)
+cfgp = da.load_config()
+moved = cv2.copyMakeBorder(img, 37, 0, 55, 0, cv2.BORDER_REPLICATE)          # belt 55 px right, 37 px down
+det = da.auto_detect(moved, cfgp)
+for s_ in range(1, 6):
+    d = det[s_]
+    assert d["source"] == "previous" and d["box"][:2] == [boxes[s_][0] + 55, boxes[s_][1] + 37], (s_, d["box"])
+    if s_ >= 3:
+        assert d["bar_box"][:2] == [bars[s_][0] + 55, bars[s_][1] + 37]
+print("auto-detect (saved calibration, window moved): all five reused")
+print("ALL CHECKS PASSED")
