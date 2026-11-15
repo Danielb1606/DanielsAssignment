@@ -710,7 +710,7 @@ class CompactBar(tk.Toplevel):
 
 # ================================================================ main window
 class App(tk.Tk):
-    def __init__(self):
+    def __init__(self, updated_info: Optional[dict] = None):
         super().__init__()
         self.title(core.APP)
         self.configure(bg=BG)
@@ -729,6 +729,8 @@ class App(tk.Tk):
         self._update_info = None
         if updater.is_packaged() and updater.UPDATE_REPO:
             threading.Thread(target=self._check_update, daemon=True).start()
+        if updated_info:
+            self.after(400, lambda: self._show_updated(updated_info))
         self.protocol("WM_DELETE_WINDOW", self._close)
 
     def _style(self):
@@ -749,7 +751,11 @@ class App(tk.Tk):
         head = tk.Frame(self, bg=BG)
         head.pack(fill="x", padx=22, pady=(18, 6))
         tk.Label(head, text=core.APP, bg=BG, fg=GOLD, font=TITLE_FONT).pack(side="left")
-        tk.Label(head, text=f"v{core.__version__}", bg=BG, fg=MUTED, font=SMALL).pack(side="left", padx=10, pady=(10, 0))
+        tk.Label(head, text=f"v{core.__version__}", bg=BG, fg=MUTED, font=SMALL).pack(side="left", padx=(10, 2), pady=(10, 0))
+        self.check_lbl = tk.Label(head, text="Check for updates", bg=BG, fg=GOLD, font=("Segoe UI", 9, "underline"),
+                                  cursor="hand2")
+        self.check_lbl.pack(side="left", padx=6, pady=(10, 0))
+        self.check_lbl.bind("<Button-1>", lambda _: self._manual_check())
         self.status = tk.Label(head, text="●  Idle", bg=PANEL_2, fg=MUTED, font=H_FONT, padx=14, pady=5)
         self.status.pack(side="right")
         button(head, "▭  Compact", self.enter_compact, font=FONT, padx=10, pady=5).pack(side="right", padx=(0, 10))
@@ -1144,14 +1150,32 @@ class App(tk.Tk):
             if msg == "__STOP__":
                 self.toggle_run()
             elif msg == "__UPDATE__":
+                self.check_lbl.config(text="Check for updates")
                 self._show_banner()
             elif msg.startswith("__PROGRESS__"):
                 self.banner_lbl.config(text=f"Downloading v{self._update_info['version']}…  {msg[12:]}")
+            elif msg == "__INSTALLING__":
+                self.banner_lbl.config(text=f"Starting v{self._update_info['version']}…")
             elif msg == "__UPDATED__":
+                if self.mini is not None:
+                    self.mini.destroy()
                 self.destroy()
                 return
+            elif msg == "__ROLLED_BACK__":
+                set_button(self.banner_btn, text="Try again", enabled=True)
+                self.banner_lbl.config(text="The new version didn't start, so this version was kept.")
+                messagebox.showwarning(core.APP, "The new version didn't start properly, so the update was "
+                                                 f"undone and you're still on v{core.__version__}.\n\n"
+                                                 "You can try again, or download it from the Releases page.")
             elif msg == "__UPDATE_FAILED__":
                 set_button(self.banner_btn, text="Try again", enabled=True)
+            elif msg == "__NO_UPDATE__":
+                self.check_lbl.config(text="Check for updates")
+                messagebox.showinfo(core.APP, f"You're on the latest version (v{core.__version__}).")
+            elif msg == "__CHECK_FAILED__":
+                self.check_lbl.config(text="Check for updates")
+                messagebox.showwarning(core.APP, "Couldn't reach GitHub to check for updates. "
+                                                 "Check your internet connection and try again.")
             elif msg in ("__TOWN_ON__", "__TOWN_OFF__"):
                 self._alert(msg == "__TOWN_ON__")
             else:
@@ -1198,35 +1222,59 @@ class App(tk.Tk):
         self.after(250, self._tick)
 
     # -- updates --------------------------------------------------------------
-    def _check_update(self):
+    def _check_update(self, manual: bool = False):
         try:
             info = updater.check(core.__version__)
         except Exception:
+            if manual:
+                self.log_q.put("__CHECK_FAILED__")
             return                               # offline etc. - try next launch
         if info:
             self._update_info = info
-            self.log_q.put(f"__UPDATE__")
+            self.log_q.put("__UPDATE__")
+        elif manual:
+            self.log_q.put("__NO_UPDATE__")
+
+    def _manual_check(self):
+        if not updater.is_packaged():
+            messagebox.showinfo(core.APP, "Updates are only installed by the .exe version of the app.")
+            return
+        self.check_lbl.config(text="Checking…")
+        threading.Thread(target=self._check_update, args=(True,), daemon=True).start()
 
     def _show_banner(self):
         v = self._update_info["version"]
         self.banner_lbl.config(text=f"A new version (v{v}) is available.")
-        self.banner.pack(fill="x", padx=22, pady=(0, 4), after=self._head)
+        set_button(self.banner_btn, text="Update now", enabled=True)
+        if not self.banner.winfo_ismapped():
+            self.banner.pack(fill="x", padx=22, pady=(0, 4), after=self._head)
         self.write_log(f"Update available: v{v}.")
+
+    def _show_updated(self, info: dict):
+        notes = _clean_notes(info.get("notes", ""))
+        self.write_log(f"Updated to v{core.__version__}.")
+        messagebox.showinfo(core.APP, f"Updated to v{core.__version__}" +
+                            (f" (from v{info.get('from')})" if info.get("from") else "") +
+                            (f"\n\nWhat's new:\n{notes}" if notes else ""))
 
     def _do_update(self):
         info = self._update_info
         if not info or not messagebox.askokcancel(
-                core.APP, f"Update to v{info['version']} now?\n\nThe app will close, update and reopen. "
-                          "Your calibration is kept."):
+                core.APP, f"Update to v{info['version']} now?\n\nThe app will download it "
+                          f"({info.get('size', 0) / 1e6:.0f} MB), close and reopen. Your calibration is kept."):
             return
         self.engine.stop()
-        set_button(self.banner_btn, text="Downloading…", enabled=False)
+        set_button(self.banner_btn, text="Updating…", enabled=False)
+
+        def progress(f):
+            self.log_q.put(f"__PROGRESS__{f:.0%}")
+            if f >= 1.0:
+                self.log_q.put("__INSTALLING__")
 
         def work():
             try:
-                updater.download_and_restart(
-                    info, lambda f: self.log_q.put(f"__PROGRESS__{f:.0%}"))
-                self.log_q.put("__UPDATED__")
+                ok = updater.install_and_restart(info, core.DATA_DIR, core.__version__, progress)
+                self.log_q.put("__UPDATED__" if ok else "__ROLLED_BACK__")
             except Exception as e:
                 self.log_q.put(f"Update failed: {e}")
                 self.log_q.put("__UPDATE_FAILED__")
@@ -1255,9 +1303,21 @@ def _dpi_aware():
                 pass
 
 
+def _clean_notes(notes: str) -> str:
+    keep = [l for l in notes.splitlines()
+            if l.strip() and not l.startswith(("Co-Authored-By", "Claude-Session", "**Full Changelog"))]
+    return "\n".join(keep[:12])
+
+
 def launch():
     _dpi_aware()
-    app = App()
+    updated = None
+    if updater.is_packaged():
+        try:
+            updated = updater.on_startup(core.DATA_DIR, core.__version__)
+        except Exception:
+            updated = None
+    app = App(updated)
     app.update_idletasks()
     w = min(app.winfo_reqwidth(), app.winfo_screenwidth() - 40)
     h = min(app.winfo_reqheight(), app.winfo_screenheight() - 80)
