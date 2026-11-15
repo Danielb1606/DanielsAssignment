@@ -210,7 +210,10 @@ class FlaskCard(tk.Frame):
         super().__init__(parent, bg=PANEL, highlightthickness=2, highlightbackground=BORDER)
         self.slot, self.kind = slot, kind
         tk.Label(self, text=f"{slot}  ·  {KIND_LABEL[kind]}", bg=PANEL, fg=GOLD, font=H_FONT).pack(pady=(8, 4))
-        self.canvas = tk.Label(self, bg="#0c0a08", width=THUMB_W, height=THUMB_H)
+        # A Label's width/height are in text characters unless it shows an
+        # image, so it always shows one: a blank placeholder until calibrated.
+        self._blank = tk.PhotoImage(width=THUMB_W, height=THUMB_H)
+        self.canvas = tk.Label(self, bg="#0c0a08", image=self._blank, borderwidth=0)
         self.canvas.pack(padx=10)
         self.pill = tk.Label(self, text="NOT CALIBRATED", bg=GREY, fg=TEXT, font=PILL_FONT, pady=4)
         self.pill.pack(fill="x", padx=10, pady=(8, 2))
@@ -226,10 +229,10 @@ class FlaskCard(tk.Frame):
 
     def show_image(self, bgr: Optional[np.ndarray]) -> None:
         if bgr is None or bgr.size == 0:
-            self.canvas.config(image="", width=THUMB_W, height=THUMB_H)
+            self.canvas.config(image=self._blank)
             return
         self._photo = to_photo(bgr, THUMB_W, THUMB_H)
-        self.canvas.config(image=self._photo, width=THUMB_W, height=THUMB_H)
+        self.canvas.config(image=self._photo)
 
     def set_state(self, label: str, colour: str, detail: str = "", running: Optional[bool] = None) -> None:
         self.pill.config(text=label, bg=colour)
@@ -836,8 +839,28 @@ class App(tk.Tk):
         self.destroy()
 
 
+def _dpi_aware():
+    """Decide DPI handling once, before any window exists (changing it later
+    makes Windows rescale the app unpredictably)."""
+    import sys
+    if sys.platform == "win32":
+        import ctypes
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        except Exception:
+            try:
+                ctypes.windll.user32.SetProcessDPIAware()
+            except Exception:
+                pass
+
+
 def launch():
+    _dpi_aware()
     app = App()
+    app.update_idletasks()
+    w = min(app.winfo_reqwidth(), app.winfo_screenwidth() - 40)
+    h = min(app.winfo_reqheight(), app.winfo_screenheight() - 80)
+    app.geometry(f"{w}x{h}+{max(0, (app.winfo_screenwidth() - w) // 2)}+{max(0, (app.winfo_screenheight() - h) // 3)}")
     app.mainloop()
 
 

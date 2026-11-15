@@ -50,7 +50,7 @@ import cv2
 import numpy as np
 
 APP = "Daniels Assignment"
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 # Saved next to the .exe when packaged (a one-file .exe unpacks itself to a
 # temporary folder, so __file__ would point somewhere that gets deleted).
 _BASE = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
