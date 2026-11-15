@@ -786,8 +786,10 @@ class TriggerEditDialog(tk.Toplevel):
         self.result = None          # dict, or "delete"
         tk.Label(self, text="New trigger" if is_new else "Edit trigger", bg=BG, fg=GOLD,
                  font=TITLE_FONT).pack(anchor="w", padx=20, pady=(16, 0))
-        tk.Label(self, text="When the colour you pick in its box disappears, this presses a key.",
-                 bg=BG, fg=MUTED, font=FONT).pack(anchor="w", padx=20)
+        tk.Label(self, text=("Set the key and timing here. After Save you'll draw a box around the area and "
+                              "click the colour to watch." if is_new else
+                              "To change the area or colour, use the trigger's Calibrate button."),
+                 bg=BG, fg=MUTED, font=FONT, wraplength=560, justify="left").pack(anchor="w", padx=20)
         f = tk.Frame(self, bg=PANEL, highlightthickness=1, highlightbackground=BORDER)
         f.pack(fill="x", padx=20, pady=12)
         self.vars = {}
@@ -843,7 +845,7 @@ class TriggerEditDialog(tk.Toplevel):
         bar.pack(fill="x", padx=20, pady=(4, 16))
         if not is_new:
             button(bar, "Delete trigger", self._delete, kind="ghost").pack(side="left")
-        button(bar, "Save", self._save, kind="primary").pack(side="right")
+        button(bar, "Save and pick the colour  ▶" if is_new else "Save", self._save, kind="primary").pack(side="right")
         button(bar, "Cancel", self.destroy).pack(side="right", padx=8)
 
     def _record(self):
