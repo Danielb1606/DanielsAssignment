@@ -317,3 +317,24 @@ hl._press(_K(vk=119)); assert hits[-1] == "hotkey_pause"                 # F8
 hl.paused = True; hl._press(_K(vk=120)); assert hits[-1] == "hotkey_pause"   # ignored while recording
 print("hotkeys: Shift+E style combos, defaults F7/F8/F9, conflict checks ok")
 print("ALL CHECKS PASSED")
+
+# 19. hotkeys: names, modifiers, conflicts, matching
+assert da.normalize_hotkey("Shift + E") == "shift+e" and da.normalize_hotkey("e+ctrl+shift") == "ctrl+shift+e"
+assert da.get_settings({})["hotkey_toggle"] == "f7" and da.hotkey_label("shift+e") == "Shift + E"
+st = da.get_settings({"settings": {"hotkey_toggle": "1"}})
+assert any("flask key" in e for e in da.validate_settings(st))
+st = da.get_settings({"settings": {"hotkey_toggle": "shift+1"}})
+assert not da.validate_settings(st)
+class K:            # stand-in for pynput keys
+    shift = shift_l = shift_r = "SHIFT"; ctrl = ctrl_l = ctrl_r = "CTRL"; alt = alt_l = alt_r = alt_gr = "ALT"
+class Key:
+    def __init__(s, vk): s.vk = vk
+got = []
+hl = da.HotkeyListener(da.get_settings({"settings": {"hotkey_toggle": "shift+e"}}), got.append)
+hl._kb = type("kb", (), {"Key": K})
+hl._press(Key(69))                         # E alone: nothing
+hl._press("SHIFT"); hl._press(Key(69)); hl._release("SHIFT")
+hl._press(Key(119))                        # F8
+assert got == ["hotkey_toggle", "hotkey_pause"], got
+print("hotkeys ok")
+print("ALL CHECKS PASSED")
