@@ -807,6 +807,7 @@ class SettingsDialog(tk.Toplevel):
         ("refire_cooldown_ms", "Same-flask cooldown (ms)", "Minimum gap between presses of one flask."),
         ("fails_for_town", "Presses with no effect before town mode", "Lower = pauses sooner in town."),
         ("verify_ms", "Time allowed for a press to work (ms)", "Raise this if town mode turns on by mistake."),
+        ("town_retry_s", "In town mode, retry a quicksilver every (s)", "Ends town mode soon after it's over. 0 = off."),
     ]
 
     def __init__(self, parent, cfg: dict, running: bool):
@@ -1449,6 +1450,8 @@ class App(tk.Tk):
             run = rd.active if card.kind == "quicksilver" else None
             if not rd.visible:
                 card.set_state("NOT VISIBLE", ORANGE, "belt hidden / covered", run)
+            elif rd.brightness < core.PAUSE_DIM:
+                card.set_state("PAUSED", GREY, "program looks paused (dimmed)", run)
             elif rd.full:
                 card.set_state("FULL", GREEN, f"about {rd.fill:.0%}", run)
             else:
@@ -1665,7 +1668,10 @@ class App(tk.Tk):
                 core.save_config(self.cfg)
         else:
             c = self.engine.controller
-            if c and c.town_mode:
+            if c and c.program_paused:
+                self._set_status("Program paused · waiting", "#7fb4e6")
+                self.town_btn.pack_forget()
+            elif c and c.town_mode:
                 self._set_status("Town mode · not pressing", ORANGE)
                 self.town_btn.pack(side="right", padx=8)
             elif c and c.paused:
@@ -1690,6 +1696,7 @@ class App(tk.Tk):
             with self.engine.lock:
                 r = self.engine.latest
             short = {"Test mode · nothing is pressed": "Test mode", "Town mode · not pressing": "Town mode",
+                     "Program paused · waiting": "Paused (program)",
                      "Window resized · not pressing": "Resized!"}.get(self._status[0], self._status[0])
             self.mini.update_view(r if mode != "idle" else None, short, self._status[1], mode)
         self.after(250, self._tick)

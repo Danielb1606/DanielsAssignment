@@ -338,3 +338,40 @@ hl._press(Key(119))                        # F8
 assert got == ["hotkey_toggle", "hotkey_pause"], got
 print("hotkeys ok")
 print("ALL CHECKS PASSED")
+
+# 20. program paused (belt dims to ~50%): detected as paused, nothing pressed, no town mode
+cfg5 = da.load_config()
+dimmed = (img.astype(np.float32) * 0.5).astype(np.uint8)
+r = da.FlaskReader(cfg5, frame_source=lambda: dimmed).read()
+assert all(v.visible and v.brightness < da.PAUSE_DIM for v in r.values()), {k: round(v.brightness, 2) for k, v in r.items()}
+r = da.FlaskReader(cfg5, frame_source=lambda: img).read()
+assert all(0.9 < v.brightness < 1.1 for v in r.values())
+class P(One):
+    def __init__(s): super().__init__(); s.dim = False
+    def read(s): return {k: da.SlotReading(True, True, False, 1.0, 1.0, s.sig[k].copy(), 0.5 if s.dim else 1.0) for k in range(1, 6)}
+sp = P(); sp.dim = True
+cp = da.FlaskController(sp.read, sp.press, clock=sp.now, sleep=sp.sleep, rng=random.Random(6), log=lambda m: None)
+cp.run(10)
+assert sp.presses == [] and not cp.town_mode and cp.program_paused
+sp.dim = False; cp.run(1)
+assert sp.presses and not cp.program_paused
+print("paused program: no presses, no town mode, resumes at once")
+
+# 21. town mode retry: once quicksilvers work again, town mode ends within the retry time
+class T(One):
+    def __init__(s): super().__init__(); s.town = True
+    def press(s, k):
+        s.presses.append(k)
+        if not s.town and k >= 3: s.sig[k] += 25
+        return True
+stt = T(); logs_t = []
+ct = da.FlaskController(stt.read, stt.press, clock=stt.now, sleep=stt.sleep, rng=random.Random(7),
+                        log=logs_t.append, settings=da.get_settings({"settings": {"town_retry_s": 3}}))
+ct.run(6)
+assert ct.town_mode
+n_town = len(stt.presses); stt.town = False; t0 = stt.t
+ct.run(8)
+assert not ct.town_mode, logs_t[-5:]
+left = next(l for l in logs_t if "worked again" in l)
+print("town retry: left town mode ->", left.strip(), f"(presses while in town: {n_town})")
+print("ALL CHECKS PASSED")

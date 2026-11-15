@@ -57,7 +57,7 @@ RECENT_ERRORS: "collections.deque[str]" = collections.deque(maxlen=20)   # for "
 def note_error(where: str) -> None:
     """Remember the current exception (with its full traceback) for diagnostics."""
     RECENT_ERRORS.append(f"[{time.strftime('%H:%M:%S')}] {where}\n{traceback.format_exc()}")
-__version__ = "1.4.1"
+__version__ = "1.4.2"
 # Saved next to the .exe when packaged (a one-file .exe unpacks itself to a
 # temporary folder, so __file__ would point somewhere that gets deleted).
 _BASE = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
@@ -73,6 +73,7 @@ REFIRE_COOLDOWN = 0.5                # min gap between presses of the same slot
 VERIFY_WINDOW = 1.2                  # time for a press to show an effect
 FAILS_FOR_TOWN = 2                   # presses with no effect before town mode
 HIDDEN_POLLS_FOR_AREA_CHANGE = 2     # belt hidden this many checks = area change
+PAUSE_DIM = 0.8          # belt this much darker than calibration = your program is paused
 CHANGE_MIN = 6.0                     # avg grey-level change that counts as "the press did something"
 
 # Everything above can be changed in the app's Settings panel; these are the defaults.
@@ -87,6 +88,7 @@ DEFAULT_SETTINGS = {
     "refire_cooldown_ms": 500,
     "verify_ms": 1200,
     "fails_for_town": 2,
+    "town_retry_s": 3,
     "sound_alerts": True,
     "hotkey_toggle": "f7",
     "hotkey_pause": "f8",
@@ -179,6 +181,8 @@ def validate_settings(st: dict) -> List[str]:
         errs.append("Cooldown must be 0-10000 ms.")
     if not 300 <= st["verify_ms"] <= 10000:
         errs.append("Effect check window must be 300-10000 ms.")
+    if not 0 <= st.get("town_retry_s", 3) <= 120:
+        errs.append("Town retry must be 0-120 seconds (0 = off).")
     if not 1 <= st["fails_for_town"] <= 10:
         errs.append("Town mode trigger must be 1-10 presses.")
     return errs
@@ -409,6 +413,7 @@ class SlotReading:
     fill: float          # rough 0-1 estimate of how full the flask looks
     top_match: float     # share of the top-of-liquid pixels that still match
     sig: Optional[np.ndarray] = None   # small picture of the liquid area, to spot any change
+    brightness: float = 1.0            # frame brightness vs. the calibration picture (pause = dimmer)
 
 
 DEFAULT_SIMILARITY = 55   # calibration slider default (1-100)
@@ -551,6 +556,9 @@ class SlotModel:
         grown = cv2.dilate(self.mask.astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
         self.frame = ~grown
         self.ref_gray = cv2.cvtColor(ref_bgr, cv2.COLOR_BGR2GRAY).astype(np.int16)
+        bright_px = self.frame & (self.ref_gray > 20)          # ignore pure black background
+        self.bright_mask = bright_px if bright_px.sum() >= 30 else self.frame
+        self.ref_bright = float(self.ref_gray[self.bright_mask].mean()) if self.bright_mask.any() else 0.0
 
         self.liquid_share = float(self.mask.mean())
         if self.mask.any() and self.liquid_share < 0.05:
@@ -605,7 +613,10 @@ class SlotModel:
             area = crop_bgr[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
             sig = cv2.resize(cv2.cvtColor(area, cv2.COLOR_BGR2GRAY), (12, 20),
                              interpolation=cv2.INTER_AREA).astype(np.float32)
-        return SlotReading(visible, full and visible, active and visible, fill, top_match, sig)
+        brightness = 1.0
+        if self.ref_bright > 1 and self.bright_mask.any():
+            brightness = float(gray[self.bright_mask].mean()) / self.ref_bright
+        return SlotReading(visible, full and visible, active and visible, fill, top_match, sig, brightness)
 
 
 def slot_points(s: dict) -> List[Tuple[int, int]]:
@@ -838,6 +849,10 @@ class FlaskController:
         self.cooldown = st["refire_cooldown_ms"] / 1000.0
         self.verify_window = st["verify_ms"] / 1000.0
         self.fails_for_town = int(st["fails_for_town"])
+        self.town_retry = float(st.get("town_retry_s", 3))
+        self.program_paused = False      # your program is paused (belt dimmed)
+        self.probe_slot: Optional[int] = None
+        self.last_probe = -1e9
         self.on_town: Callable[[bool], None] = lambda on: None
         self.clock, self.sleep = clock, sleep
         self.rng = rng or random.Random()
@@ -865,6 +880,8 @@ class FlaskController:
         if not self.town_mode:
             self.town_mode = True
             self.belt_hidden_in_town = False
+            self.probe_slot = None
+            self.last_probe = self.clock()
             self.queue.clear(); self.queued.clear(); self.verify.clear()
             self.log(f"TOWN MODE ON  - {why}. Not pressing flasks.")
             self.on_town(True)
@@ -894,6 +911,18 @@ class FlaskController:
         if self.town_mode and self.belt_hidden_in_town:
             self.leave_town("flask belt was hidden and came back (area change)")
 
+        # paused program: the belt dims. Press nothing, count nothing, resume as soon as it brightens.
+        vis = [x.brightness for x in r.values() if x.visible]
+        dim = bool(vis) and float(np.median(vis)) < PAUSE_DIM
+        if dim != self.program_paused:
+            self.program_paused = dim
+            self.log("Your program looks paused - waiting." if dim else "Your program is running again - resuming.")
+        if dim:
+            self.queue.clear(); self.queued.clear(); self.verify.clear()
+            self.before.clear()
+            self.prev_full = {k: v.full for k, v in r.items()}
+            return
+
         # did recent presses do anything?
         for slot, deadline in list(self.verify.items()):
             if not r[slot].full or r[slot].active or self._changed(slot, r[slot]):
@@ -902,9 +931,16 @@ class FlaskController:
                     self.fails = 0
                     self.failed_slots.clear()
                 self.wait_refill.add(slot)
+                if self.town_mode and slot == self.probe_slot:
+                    self.probe_slot = None
+                    self.leave_town(f"quicksilver {slot} worked again")
             elif now >= deadline:
                 self.verify.pop(slot, None)
                 self.wait_refill.discard(slot)
+                if self.town_mode:
+                    if slot == self.probe_slot:
+                        self.probe_slot = None
+                    continue
                 if slot not in QUICKSILVER_SLOTS:
                     continue      # life/mana can't be drunk at full life/mana - not a sign of town
                 self.fails += 1
@@ -933,7 +969,18 @@ class FlaskController:
                          "empty glass. Recalibrate it with a lower Similarity.")
         self.last = r
 
-        if self.paused or self.town_mode:
+        if self.paused:
+            return
+        if self.town_mode:
+            # every few seconds, quietly try one quicksilver; if it works, town mode ends
+            if (self.town_retry > 0 and self.probe_slot is None and now - self.last_probe >= self.town_retry
+                    and not self.queue):
+                for slot in sorted(QUICKSILVER_SLOTS, key=lambda q: self.last_press.get(q, -1e9)):
+                    if r[slot].visible and r[slot].full and slot not in self.verify:
+                        self.probe_slot = slot
+                        self.last_probe = now
+                        self._schedule(slot, now)
+                        break
             return
 
         if not self._quicksilver_running(r, now):
@@ -977,7 +1024,7 @@ class FlaskController:
         while self.queue and self.queue[0].fire_at <= now:
             p = heapq.heappop(self.queue)
             self.queued.discard(p.slot)
-            if self.paused or self.town_mode:
+            if self.paused or self.program_paused or (self.town_mode and p.slot != self.probe_slot):
                 continue
             if self.press(p.slot):
                 self.last_press[p.slot] = now
