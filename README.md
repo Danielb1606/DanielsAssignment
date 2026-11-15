@@ -15,8 +15,8 @@ Calibration is saved in a `daniels_assignment_data` folder next to the .exe.
 5. **Start** - runs it. F8 pause/resume, F9 leave town mode, F10 stop.
 
 ## Auto-update
-Set `UPDATE_REPO = "owner/repo"` in `updater.py`, push this folder to that GitHub
-repo, then push a version tag (e.g. `git tag v1.0.1 && git push --tags`).
+Releases come from https://github.com/Danielb1606/DanielsAssignment/releases.
+To publish a new version: raise `__version__` in `daniels_assignment.py` and push to main.
 GitHub builds the .exe (`.github/workflows/release.yml`) and the app offers the update
 the next time it opens.
 

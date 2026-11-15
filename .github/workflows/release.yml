@@ -1,10 +1,12 @@
 # Builds DanielsAssignment.exe on Windows and publishes it as a GitHub Release
-# whenever a version tag (e.g. v1.0.1) is pushed. The app updates itself from these.
+# whenever main is pushed with a new __version__ in daniels_assignment.py.
+# The app updates itself from these releases.
 name: Build and release
 
 on:
   push:
-    tags: ["v*"]
+    branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -15,24 +17,34 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Read version
+        id: ver
+        shell: pwsh
+        run: |
+          $m = Select-String -Path daniels_assignment.py -Pattern '__version__ = "(.+)"'
+          $v = $m.Matches[0].Groups[1].Value
+          "version=$v" >> $env:GITHUB_OUTPUT
+          gh release view "v$v" 2>$null
+          if ($LASTEXITCODE -eq 0) { "exists=true" >> $env:GITHUB_OUTPUT } else { "exists=false" >> $env:GITHUB_OUTPUT }
+          exit 0
+        env:
+          GH_TOKEN: ${{ github.token }}
+
       - uses: actions/setup-python@v5
+        if: steps.ver.outputs.exists == 'false'
         with:
           python-version: "3.12"
 
-      - name: Stamp version from tag
-        shell: pwsh
-        run: |
-          $v = "${{ github.ref_name }}".TrimStart('v')
-          (Get-Content daniels_assignment.py) -replace '__version__ = ".*"', "__version__ = `"$v`"" |
-            Set-Content daniels_assignment.py
-
       - name: Install
+        if: steps.ver.outputs.exists == 'false'
         run: pip install -r requirements.txt pyinstaller
 
       - name: Run checks
+        if: steps.ver.outputs.exists == 'false'
         run: python test_offline.py flasks.png
 
       - name: Build exe
+        if: steps.ver.outputs.exists == 'false'
         run: >
           pyinstaller --onefile --windowed --name DanielsAssignment
           --collect-submodules pynput
@@ -40,7 +52,11 @@ jobs:
           daniels_assignment.py
 
       - name: Publish release
+        if: steps.ver.outputs.exists == 'false'
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: v${{ steps.ver.outputs.version }}
+          name: Daniels Assignment v${{ steps.ver.outputs.version }}
+          target_commitish: ${{ github.sha }}
           files: dist/DanielsAssignment.exe
           generate_release_notes: true
