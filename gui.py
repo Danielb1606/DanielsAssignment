@@ -11,7 +11,7 @@ from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
-from PIL import Image, ImageTk
+import base64
 
 import daniels_assignment as core
 import updater
@@ -40,14 +40,17 @@ THUMB_W, THUMB_H = 120, 165
 KIND_LABEL = {"life": "Life", "mana": "Mana", "quicksilver": "Quicksilver"}
 
 
-def to_photo(bgr: np.ndarray, max_w: int, max_h: int, upscale=True) -> ImageTk.PhotoImage:
+def to_photo(bgr: np.ndarray, max_w: int, max_h: int, upscale=True) -> tk.PhotoImage:
+    """OpenCV image -> Tk image. Uses Tk's own PNG support, so no extra
+    imaging library is needed (that library caused the old start-up crash)."""
     h, w = bgr.shape[:2]
     s = min(max_w / w, max_h / h)
     if not upscale:
         s = min(s, 1.0)
     img = cv2.resize(bgr, (max(1, int(w * s)), max(1, int(h * s))),
                      interpolation=cv2.INTER_NEAREST if s > 1 else cv2.INTER_AREA)
-    return ImageTk.PhotoImage(Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB)))
+    ok, png = cv2.imencode(".png", img)
+    return tk.PhotoImage(data=base64.b64encode(png.tobytes()).decode("ascii"))
 
 
 def button(parent, text, cmd, kind="normal", **kw):
@@ -264,7 +267,8 @@ class FlaskCard(tk.Frame):
 
 # ================================================================ calibration dialog
 class CalibrationDialog(tk.Toplevel):
-    """Step-by-step: box each flask, click its liquid, then the timer strips."""
+    """Step-by-step: box each flask, pick its liquid with a click + Similarity
+    slider, let the app find quicksilvers 4 and 5, then the timer strips."""
 
     def __init__(self, parent, img: np.ndarray, cfg: dict, slots: List[int]):
         super().__init__(parent, bg=BG)
@@ -275,22 +279,36 @@ class CalibrationDialog(tk.Toplevel):
         self.result = None
 
         self.steps: List[Tuple[str, int]] = []
-        for s in slots:
-            self.steps += [("box", s), ("liquid", s)]
+        if sorted(slots) == [1, 2, 3, 4, 5]:
+            for s in (1, 2, 3):
+                self.steps += [("box", s), ("liquid", s)]
+            self.steps += [("find", 4)]
+        else:
+            for s in slots:
+                self.steps += [("box", s), ("liquid", s)]
         self.steps += [("bar", s) for s in slots if s in core.QUICKSILVER_SLOTS]
         self.i = 0
         self.boxes: Dict[int, List[int]] = {}
         self.points: Dict[int, List[Tuple[int, int]]] = {}
+        self.liq: Dict[int, dict] = {}
+        for s in slots:
+            sc = core.slot_cfg(cfg, s)
+            keep_old = len(slots) == 1 and sc.get("similarity")
+            self.liq[s] = {"similarity": int(sc.get("similarity", core.DEFAULT_SIMILARITY)) if keep_old
+                           else core.DEFAULT_SIMILARITY,
+                           "mode": sc.get("pick_mode", "shape") if keep_old else "shape"}
         self.bars: Dict[int, List[int]] = {}
+        self.found: List[List[int]] = []
 
         sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
-        self.max_w, self.max_h = min(1280, sw - 120), min(720, sh - 260)
+        self.max_w, self.max_h = min(1280, sw - 120), min(640, sh - 320)
 
         top = tk.Frame(self, bg=BG)
         top.pack(fill="x", padx=16, pady=(14, 6))
         self.step_lbl = tk.Label(top, text="", bg=BG, fg=GOLD, font=H_FONT)
         self.step_lbl.pack(anchor="w")
-        self.instr = tk.Label(top, text="", bg=BG, fg=TEXT, font=("Segoe UI", 12), justify="left")
+        self.instr = tk.Label(top, text="", bg=BG, fg=TEXT, font=("Segoe UI", 12), justify="left",
+                              wraplength=760)
         self.instr.pack(anchor="w", pady=(2, 0))
 
         self.canvas = tk.Canvas(self, bg="#0c0a08", highlightthickness=0, cursor="crosshair")
@@ -299,13 +317,41 @@ class CalibrationDialog(tk.Toplevel):
         self.canvas.bind("<B1-Motion>", self._drag)
         self.canvas.bind("<ButtonRelease-1>", self._up)
 
+        # liquid controls (only on liquid steps)
+        self.liq_frame = tk.Frame(self, bg=PANEL, highlightthickness=1, highlightbackground=BORDER)
+        r1 = tk.Frame(self.liq_frame, bg=PANEL)
+        r1.pack(fill="x", padx=12, pady=(8, 2))
+        tk.Label(r1, text="Similarity", bg=PANEL, fg=GOLD, font=H_FONT, width=10, anchor="w").pack(side="left")
+        tk.Label(r1, text="strict", bg=PANEL, fg=MUTED, font=SMALL).pack(side="left")
+        self.sim_var = tk.IntVar(value=core.DEFAULT_SIMILARITY)
+        st = ttk.Style(self)
+        st.configure("Gold.Horizontal.TScale", troughcolor=PANEL_2, background=GOLD, bordercolor=BORDER,
+                     lightcolor=GOLD, darkcolor="#a8853f", sliderthickness=18)
+        self.slider = ttk.Scale(r1, from_=1, to=100, orient="horizontal", length=340,
+                                style="Gold.Horizontal.TScale",
+                                command=lambda v: self._slider_moved(v))
+        self.slider.pack(side="left", padx=8, pady=4)
+        tk.Label(r1, text="loose", bg=PANEL, fg=MUTED, font=SMALL).pack(side="left")
+        self.sim_lbl = tk.Label(r1, text="", bg=PANEL, fg=TEXT, font=H_FONT, width=4)
+        self.sim_lbl.pack(side="left", padx=(10, 0))
+        r2 = tk.Frame(self.liq_frame, bg=PANEL)
+        r2.pack(fill="x", padx=12, pady=(2, 8))
+        tk.Label(r2, text="Pick from", bg=PANEL, fg=GOLD, font=H_FONT, width=10, anchor="w").pack(side="left")
+        self.mode_var = tk.StringVar(value="shape")
+        for val, label in (("shape", "Inside flask shape"), ("box", "Anywhere in box")):
+            tk.Radiobutton(r2, text=label, value=val, variable=self.mode_var, bg=PANEL, fg=TEXT,
+                           selectcolor=PANEL_2, activebackground=PANEL, activeforeground=TEXT, font=FONT,
+                           highlightthickness=0, command=self._on_liquid_setting).pack(side="left", padx=(0, 14))
+        self.undo_btn = button(r2, "Undo click", self._undo_click, kind="ghost", font=SMALL, pady=3)
+        self.undo_btn.pack(side="right")
+
         bar = tk.Frame(self, bg=BG)
-        bar.pack(fill="x", padx=16, pady=(4, 14))
+        bar.pack(fill="x", padx=16, pady=(4, 14), side="bottom")
         button(bar, "Cancel", self.destroy, kind="ghost").pack(side="left")
         self.back_btn = button(bar, "◀  Back", self._back)
         self.back_btn.pack(side="left", padx=8)
-        self.undo_btn = button(bar, "Undo click", self._undo_click, kind="ghost")
-        self.next_btn = button(bar, "Use this  ▶", self._accept_default, kind="primary")
+        self.manual_btn = button(bar, "Draw them myself", self._find_manual)
+        self.next_btn = button(bar, "Next  ▶", self._accept_default, kind="primary")
         self.next_btn.pack(side="right")
 
         self._drag_start = None
@@ -340,35 +386,63 @@ class CalibrationDialog(tk.Toplevel):
         return ((x - self.view[0]) * s, (y - self.view[1]) * s,
                 (x + w - self.view[0]) * s, (y + h - self.view[1]) * s)
 
-    def _draw_box(self, box, colour, dash=None, width=2, tag=None):
-        self.canvas.create_rectangle(*self._to_canvas(box), outline=colour, width=width, dash=dash, tags=tag)
+    def _draw_box(self, box, colour, dash=None, width=2, tag=None, label=None):
+        x0, y0, x1, y1 = self._to_canvas(box)
+        self.canvas.create_rectangle(x0, y0, x1, y1, outline=colour, width=width, dash=dash, tags=tag)
+        if label:
+            self.canvas.create_text(x0 + 4, y0 + 2, text=label, anchor="nw", fill=colour,
+                                    font=("Segoe UI Semibold", 11), tags=tag)
 
     # -- steps ----------------------------------------------------------------
     def _render(self) -> None:
         kind, slot = self.steps[self.i]
         name = KIND_LABEL[core.SLOT_KINDS[slot]]
-        self.step_lbl.config(text=f"Step {self.i + 1} of {len(self.steps)}  ·  Flask {slot} ({name})")
+        what = "Flasks 4 and 5 (Quicksilver)" if kind == "find" else f"Flask {slot} ({name})"
+        self.step_lbl.config(text=f"Step {self.i + 1} of {len(self.steps)}  ·  {what}")
         set_button(self.back_btn, enabled=self.i > 0)
         if kind == "liquid":
-            self.undo_btn.pack(side="left", padx=8)
+            self.liq_frame.pack(fill="x", padx=16, pady=(0, 4))
         else:
-            self.undo_btn.pack_forget()
+            self.liq_frame.pack_forget()
+        if kind == "find":
+            self.manual_btn.pack(side="right", padx=8)
+        else:
+            self.manual_btn.pack_forget()
         self._pending_box = None
         old = core.slot_cfg(self.cfg, slot)
+        last = self.i == len(self.steps) - 1
 
         if kind == "box":
             self._set_view((0, 0, self.img.shape[1], self.img.shape[0]))
             for s, b in self.boxes.items():
-                self._draw_box(b, GREEN)
+                self._draw_box(b, GREEN, label=str(s))
             existing = old["box"] if old["box"] and self._fits(old["box"]) else None
             self._pending_box = existing
             if existing:
                 self._draw_box(existing, ORANGE, dash=(4, 3), tag="sel")
             self.instr.config(text=f"Drag a tight box around flask {slot}."
-                              + ("  The orange box is the current one." if existing else ""))
+                              + ("  The orange box is the current one - click Next to keep it." if existing else ""))
             set_button(self.next_btn, text="Next  ▶", enabled=existing is not None)
         elif kind == "liquid":
+            self.sim_var.set(self.liq[slot]["similarity"])
+            self.slider.set(self.liq[slot]["similarity"])
+            self.sim_lbl.config(text=str(self.liq[slot]["similarity"]))
+            self.mode_var.set(self.liq[slot]["mode"])
             self._show_liquid(slot)
+        elif kind == "find":
+            self._set_view((0, 0, self.img.shape[1], self.img.shape[0]))
+            for s, b in self.boxes.items():
+                self._draw_box(b, GREEN, label=str(s))
+            self.found = core.find_similar(self.img, self.boxes[3], count=2)
+            if len(self.found) == 2:
+                for n, b in zip((4, 5), self.found):
+                    self._draw_box(b, ORANGE, label=str(n))
+                self.instr.config(text="Found flasks 4 and 5 (orange). They'll use the same liquid settings as "
+                                       "flask 3.\nClick Next if the boxes are right, or Draw them myself.")
+                set_button(self.next_btn, text="Next  ▶", enabled=True)
+            else:
+                self.instr.config(text="Couldn't find flasks 4 and 5 automatically - click Draw them myself.")
+                set_button(self.next_btn, enabled=False)
         else:  # bar
             x, y, w, h = self.boxes[slot]
             pad = int(h * 0.6)
@@ -378,18 +452,38 @@ class CalibrationDialog(tk.Toplevel):
             self._set_view((vx, vy, vw, vh))
             self._draw_box(self.boxes[slot], GREEN)
             prev = old["bar_box"] if (old["bar_box"] and len(self.slots) == 1) else None
+            if prev is None and slot != 3 and 3 in self.bars and 3 in self.boxes:
+                # same position under the flask as flask 3's bar
+                b3, bx3 = self.bars[3], self.boxes[3]
+                prev = [x + (b3[0] - bx3[0]), y + (b3[1] - bx3[1]), b3[2], b3[3]]
             self._pending_box = prev or core.default_bar_box(self.boxes[slot])
             self._draw_box(self._pending_box, ORANGE, tag="sel")
             self.instr.config(text=f"The orange box is where flask {slot}'s timer bar is read.\n"
                                    "Click Next to use it, or drag a new box where the bar appears.")
             set_button(self.next_btn, text="Next  ▶", enabled=True)
-        if self.i == len(self.steps) - 1 and kind == "bar":
+        if last and kind in ("bar", "liquid"):
             set_button(self.next_btn, text="Finish  ✓")
 
     def _liquid(self, slot):
         x, y, w, h = self.boxes[slot]
         rel = [(px - x, py - y) for px, py in self.points.get(slot, [])]
-        return core.liquid_mask(self.img[y:y + h, x:x + w], rel)
+        st = self.liq[slot]
+        return core.liquid_selection(self.img[y:y + h, x:x + w], rel, st["similarity"], st["mode"])
+
+    def _slider_moved(self, v):
+        val = int(round(float(v)))
+        if val == self.sim_var.get() and self.sim_lbl.cget("text") == str(val):
+            return
+        self.sim_var.set(val)
+        self.sim_lbl.config(text=str(val))
+        self._on_liquid_setting()
+
+    def _on_liquid_setting(self):
+        kind, slot = self.steps[self.i]
+        if kind != "liquid":
+            return
+        self.liq[slot] = {"similarity": int(self.sim_var.get()), "mode": self.mode_var.get()}
+        self._show_liquid(slot)
 
     def _show_liquid(self, slot):
         name = KIND_LABEL[core.SLOT_KINDS[slot]].lower()
@@ -400,17 +494,17 @@ class CalibrationDialog(tk.Toplevel):
             self.canvas.create_oval(cx - 5, cy - 5, cx + 5, cy + 5, outline=YELLOW, width=2)
         share = float(mask.mean())
         if not self.points.get(slot):
-            text = (f"Click on the {name} liquid inside flask {slot}.\n"
-                    "The liquid it detects turns pink.")
+            text = f"Click on the {name} liquid inside flask {slot}. The liquid it picks turns pink."
         elif share < 0.03:
-            text = ("That spot isn't liquid (or it's too small). Click on the liquid itself - "
-                    "use Undo click to remove a wrong click.")
+            text = ("Hardly anything is pink. Move Similarity to the right, or click on the liquid itself "
+                    "(Undo click removes a wrong click).")
         else:
-            text = (f"Pink = liquid it will watch ({share:.0%} of the box). If some liquid isn't pink - "
-                    "especially along the TOP edge of the liquid - click it too.\nThen click Next.")
+            text = (f"Pink = the liquid it will watch ({share:.0%} of the box). Slide Similarity until the pink "
+                    "covers the liquid - including its top edge - but not the glass, label or decorations. "
+                    "Click any patch it still misses.")
         self.instr.config(text=text)
         set_button(self.undo_btn, enabled=bool(self.points.get(slot)))
-        set_button(self.next_btn, text="Next  ▶", enabled=share >= 0.03)
+        set_button(self.next_btn, enabled=share >= 0.03)
 
     def _undo_click(self):
         kind, slot = self.steps[self.i]
@@ -418,12 +512,23 @@ class CalibrationDialog(tk.Toplevel):
             self.points[slot].pop()
             self._show_liquid(slot)
 
+    def _find_manual(self):
+        kind, _ = self.steps[self.i]
+        if kind != "find":
+            return
+        self.steps[self.i:self.i + 1] = [("box", 4), ("liquid", 4), ("box", 5), ("liquid", 5)]
+        for s in (4, 5):
+            self.liq[s] = dict(self.liq.get(3, {"similarity": core.DEFAULT_SIMILARITY, "mode": "shape"}))
+        self._render()
+
     def _fits(self, box) -> bool:
         x, y, w, h = box
         return x >= 0 and y >= 0 and x + w <= self.img.shape[1] and y + h <= self.img.shape[0]
 
     def _down(self, e):
         kind, slot = self.steps[self.i]
+        if kind == "find":
+            return
         if kind == "liquid":
             self.points.setdefault(slot, []).append(self._to_img(e.x, e.y))
             self._show_liquid(slot)
@@ -459,10 +564,18 @@ class CalibrationDialog(tk.Toplevel):
         elif kind == "liquid":
             if float(self._liquid(slot).mean()) < 0.03:
                 return
+        elif kind == "find":
+            if len(self.found) != 2:
+                return
+            b3 = self.boxes[3]
+            for n, b in zip((4, 5), self.found):
+                self.boxes[n] = b
+                self.points[n] = [(px - b3[0] + b[0], py - b3[1] + b[1]) for px, py in self.points.get(3, [])]
+                self.liq[n] = dict(self.liq[3])
         else:
             self.bars[slot] = self._pending_box
         if self.i == len(self.steps) - 1:
-            self.result = (self.boxes, self.bars, self.points)
+            self.result = (self.boxes, self.bars, self.points, self.liq)
             self.destroy()
             return
         self.i += 1
@@ -1094,10 +1207,10 @@ class App(tk.Tk):
         if not dlg.result:
             self.write_log("Calibration cancelled.")
             return
-        boxes, bars, points = dlg.result
+        boxes, bars, points, liq = dlg.result
         loc = self._locator()
         size = (img.shape[1], img.shape[0]) if (self.cfg.get("window_title") and loc.win) else None
-        core.calibrate_from_image(img, self.cfg, boxes, bars, points, window_size=size)
+        core.calibrate_from_image(img, self.cfg, boxes, bars, points, liquid_settings=liq, window_size=size)
         self.cfg = core.load_config()
         self.refresh_cards_idle()
         self._update_buttons()

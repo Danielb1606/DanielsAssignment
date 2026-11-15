@@ -50,7 +50,7 @@ import cv2
 import numpy as np
 
 APP = "Daniels Assignment"
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 # Saved next to the .exe when packaged (a one-file .exe unpacks itself to a
 # temporary folder, so __file__ would point somewhere that gets deleted).
 _BASE = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
@@ -123,7 +123,7 @@ INSTILLING_SLOTS = (1, 2)
 DEFAULT_BAR_RGB = (249, 215, 153)    # measured from your screenshot
 
 TOP_BAND_FRAC = 0.15  # top 15% of the liquid decides "full"
-FULL_MATCH_MIN = 0.55
+FULL_MATCH_MIN = 0.6
 VISIBLE_CORR_MIN = 0.45  # shape match of the non-liquid parts vs the reference
 BAR_RGB_TOL = 40
 BAR_MIN_PIXELS = 4
@@ -324,35 +324,82 @@ class SlotReading:
     top_match: float     # share of the top-of-liquid pixels that still match
 
 
-FILL_STEP = 40        # colour change allowed between neighbouring liquid pixels
-FILL_HUE_SPAN = 30    # liquid can drift this far in hue from the clicked spot
-PIX_TOL = 40          # live pixel vs. full-reference pixel tolerance
+DEFAULT_SIMILARITY = 55   # calibration slider default (1-100)
+PICK_MODES = ("shape", "box")
 
 
-def liquid_mask(ref_bgr: np.ndarray, points: List[Tuple[int, int]]) -> np.ndarray:
-    """Liquid area found by spreading out from each clicked point (like a
-    paint-bucket fill). It follows gradual shading - light to dark green -
-    but stops at sharp edges and at glass, wings, labels and background."""
+def _seed(hsv: np.ndarray, x: int, y: int) -> Tuple[int, float, float]:
+    """Liquid colour around a clicked spot: (hue, saturation, brightness)."""
+    patch = hsv[max(0, y - 2):y + 3, max(0, x - 2):x + 3].reshape(-1, 3).astype(float)
+    ang = patch[:, 0] * (2 * np.pi / 180)
+    hue = int(round((np.arctan2(np.sin(ang).mean(), np.cos(ang).mean()) % (2 * np.pi)) * 180 / (2 * np.pi))) % 180
+    return hue, float(np.median(patch[:, 1])), float(np.median(patch[:, 2]))
+
+
+def colour_match(hsv: np.ndarray, seeds: List[Tuple[int, float, float]], similarity: float) -> np.ndarray:
+    """Pixels whose colour is close enough to any clicked liquid colour.
+    Higher similarity = wider hue range and darker/paler shades allowed,
+    which is what shading on the liquid looks like."""
+    f = max(1.0, min(100.0, float(similarity))) / 100.0
+    hue_tol = 3 + 37 * f
+    H, S, V = (hsv[..., i].astype(np.int16) for i in range(3))
+    out = np.zeros(H.shape, bool)
+    for h0, s0, v0 in seeds:
+        out |= ((_circ_hue_dist(H, h0) <= hue_tol) & (S >= s0 * (1 - 0.85 * f))
+                & (V >= v0 * (1 - 0.9 * f)))
+    return out
+
+
+def liquid_selection(ref_bgr: np.ndarray, points: List[Tuple[int, int]],
+                     similarity: float = DEFAULT_SIMILARITY, mode: str = "shape") -> np.ndarray:
+    """The liquid area for the calibration slider.
+    mode 'shape': matching pixels inside the flask's outline - the piece you
+      clicked plus any other matching pieces that sit inside the bottle (e.g.
+      green above and below the quicksilver wings), but nothing touching the
+      edge of the box (arch, background).
+    mode 'box': every matching pixel in the box."""
     h, w = ref_bgr.shape[:2]
-    out = np.zeros((h, w), bool)
-    if not points:
-        return out
+    pts = [(int(x), int(y)) for x, y in points if 0 <= x < w and 0 <= y < h]
+    if not pts:
+        return np.zeros((h, w), bool)
     hsv = cv2.cvtColor(ref_bgr, cv2.COLOR_BGR2HSV)
-    H, S, V = (hsv[..., i].astype(int) for i in range(3))
-    for px, py in points:
-        if not (0 <= px < w and 0 <= py < h):
-            continue
-        patch = H[max(0, py - 2):py + 3, max(0, px - 2):px + 3].ravel() * (2 * np.pi / 180)
-        hue0 = int(round((np.arctan2(np.sin(patch).mean(), np.cos(patch).mean()) % (2 * np.pi)) * 180 / (2 * np.pi))) % 180
-        barrier = (S < 45) | (V < 25) | (_circ_hue_dist(H, hue0) > FILL_HUE_SPAN)
-        if barrier[py, px]:
-            continue
-        m = np.zeros((h + 2, w + 2), np.uint8)
-        m[1:-1, 1:-1] = barrier
-        cv2.floodFill(ref_bgr.copy(), m, (int(px), int(py)), 0, (FILL_STEP,) * 3, (FILL_STEP,) * 3,
-                      4 | cv2.FLOODFILL_MASK_ONLY | (2 << 8))
-        out |= m[1:-1, 1:-1] == 2
-    return cv2.morphologyEx(out.astype(np.uint8), cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8)) > 0
+    match = colour_match(hsv, [_seed(hsv, x, y) for x, y in pts], similarity)
+    match = cv2.morphologyEx(match.astype(np.uint8), cv2.MORPH_OPEN, np.ones((2, 2), np.uint8)) > 0
+    n, lab, stats, _ = cv2.connectedComponentsWithStats(match.astype(np.uint8), connectivity=8)
+    clicked = {int(lab[y, x]) for x, y in pts if lab[y, x] > 0}
+    keep = np.zeros(n, bool)
+    for i in range(1, n):
+        x0, y0, bw, bh, area = stats[i]
+        touches_edge = x0 == 0 or y0 == 0 or x0 + bw >= w or y0 + bh >= h
+        if i in clicked or (area >= 0.004 * h * w and (mode == "box" or not touches_edge)):
+            keep[i] = True
+    sel = keep[lab]
+    if mode == "box" or not sel.any():
+        return sel
+    ys, xs = np.nonzero(sel)
+    hull = cv2.convexHull(np.stack([xs, ys], 1).astype(np.int32))
+    inside = np.zeros((h, w), np.uint8)
+    cv2.fillConvexPoly(inside, hull, 1)
+    return match & (inside > 0)
+
+
+def find_similar(img: np.ndarray, box: List[int], count: int = 2, min_score: float = 0.7) -> List[List[int]]:
+    """Find other copies of the flask in `box` (e.g. the other quicksilvers).
+    Returns up to `count` boxes, left to right."""
+    x, y, w, h = box
+    tmpl = img[y:y + h, x:x + w]
+    if tmpl.size == 0 or img.shape[0] < h or img.shape[1] < w:
+        return []
+    res = cv2.matchTemplate(img, tmpl, cv2.TM_CCOEFF_NORMED)
+    res[max(0, y - h // 2):y + h // 2 + 1, max(0, x - w // 2):x + w // 2 + 1] = -1   # itself
+    found = []
+    for _ in range(count):
+        _, score, _, (mx, my) = cv2.minMaxLoc(res)
+        if score < min_score:
+            break
+        found.append([int(mx), int(my), w, h])
+        res[max(0, my - h // 2):my + h // 2 + 1, max(0, mx - w // 2):mx + w // 2 + 1] = -1
+    return sorted(found, key=lambda b: b[0])
 
 
 class SlotModel:
@@ -360,12 +407,16 @@ class SlotModel:
     on its liquid. FULL = the top of the liquid still looks like it did in
     that picture, so any flask art and any colour shading works."""
 
-    def __init__(self, ref_bgr: np.ndarray, liquid_points: Optional[List[Tuple[int, int]]] = None):
+    def __init__(self, ref_bgr: np.ndarray, liquid_points: Optional[List[Tuple[int, int]]] = None,
+                 similarity: float = DEFAULT_SIMILARITY, mode: str = "shape"):
         self.ref = ref_bgr
         self.h, self.w = ref_bgr.shape[:2]
-        self.ref_i = ref_bgr.astype(np.int16)
         self.problems: List[str] = []
-        self.mask = liquid_mask(ref_bgr, liquid_points or [])
+        self.similarity = similarity
+        pts = [(int(x), int(y)) for x, y in (liquid_points or []) if 0 <= x < self.w and 0 <= y < self.h]
+        ref_hsv = cv2.cvtColor(ref_bgr, cv2.COLOR_BGR2HSV)
+        self.seeds = [_seed(ref_hsv, x, y) for x, y in pts]
+        self.mask = liquid_selection(ref_bgr, pts, similarity, mode)
         if not self.mask.any():
             self.problems.append("no liquid found where you clicked - click on the liquid itself")
 
@@ -415,7 +466,10 @@ class SlotModel:
     def read(self, crop_bgr: np.ndarray, bar_crop: Optional[np.ndarray], bar_bgr) -> SlotReading:
         if crop_bgr.shape[:2] != (self.h, self.w):
             crop_bgr = cv2.resize(crop_bgr, (self.w, self.h))
-        same = np.abs(crop_bgr.astype(np.int16) - self.ref_i).max(axis=2) <= PIX_TOL
+        # a pixel still counts as liquid if its colour is in the range you
+        # chose with the slider - so shading, shimmer or movement inside the
+        # liquid don't matter, but grey glass (drained) does
+        same = colour_match(cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2HSV), self.seeds, self.similarity)
 
         top_match = float(same[self.band].mean()) if self.band.any() else 0.0
         full = top_match >= FULL_MATCH_MIN
@@ -451,7 +505,8 @@ def slot_points(s: dict) -> List[Tuple[int, int]]:
 
 
 def model_for(s: dict) -> SlotModel:
-    return SlotModel(cv2.imread(str(ref_path(s["slot"]))), slot_points(s))
+    return SlotModel(cv2.imread(str(ref_path(s["slot"]))), slot_points(s),
+                     s.get("similarity", DEFAULT_SIMILARITY), s.get("pick_mode", "shape"))
 
 
 # ================================================================ reader
@@ -760,6 +815,7 @@ def hue_at(img: np.ndarray, point: Tuple[int, int]) -> int:
 def calibrate_from_image(img: np.ndarray, cfg: dict, boxes: Dict[int, List[int]],
                          bar_boxes: Dict[int, List[int]],
                          liquid_points: Optional[Dict[int, object]] = None,
+                         liquid_settings: Optional[Dict[int, dict]] = None,
                          window_size: Optional[Tuple[int, int]] = None) -> List[str]:
     """Save references for the given slots and return the report lines.
     (The interactive calibrate command collects the boxes, then calls this.)"""
@@ -780,6 +836,9 @@ def calibrate_from_image(img: np.ndarray, cfg: dict, boxes: Dict[int, List[int]]
             sc["liquid_points"] = [[int(px) - box[0], int(py) - box[1]] for px, py in pts]
         else:
             sc.pop("liquid_points", None)
+        ls = (liquid_settings or {}).get(slot, {})
+        sc["similarity"] = int(ls.get("similarity", DEFAULT_SIMILARITY))
+        sc["pick_mode"] = ls.get("mode", "shape") if ls.get("mode") in PICK_MODES else "shape"
         cv2.imwrite(str(ref_path(slot)), _crop(img, box))
     save_config(cfg)
     return report(img, cfg, boxes.keys())

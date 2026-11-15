@@ -161,3 +161,39 @@ r = da.FlaskReader(cfg3, frame_source=lambda: d2).read()
 assert not r[3].full and r[4].full, (r[3], r[4])
 print("uneven-colour liquid checks passed")
 print("ALL CHECKS PASSED")
+
+# 10. shimmering liquid: hue jitter, brightness changes and moved texture inside the
+#     liquid must still read FULL; drained must not
+cfg4 = da.load_config()
+rng = np.random.default_rng(1)
+sh = img.copy()
+hsv = cv2.cvtColor(sh, cv2.COLOR_BGR2HSV).astype(int)
+for slot in range(1, 6):
+    sc = da.slot_cfg(cfg4, slot); m = da.model_for(sc); x, y, w, h = sc["box"]
+    sub = hsv[y:y + h, x:x + w]
+    moved = np.roll(sub, 2, axis=1)                                   # texture moves 2 px
+    sub[m.mask] = moved[m.mask]
+    sub[..., 0][m.mask] = (sub[..., 0][m.mask] + rng.integers(-4, 5, m.mask.sum())) % 180
+    sub[..., 2][m.mask] = np.clip(sub[..., 2][m.mask] * rng.uniform(0.8, 1.15, m.mask.sum()), 0, 255)
+sh = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
+r = da.FlaskReader(cfg4, frame_source=lambda: sh).read()
+assert all(v.full for v in r.values()), {k: round(v.top_match, 2) for k, v in r.items()}
+print("shimmer: all FULL", {k: f"{v.top_match:.0%}" for k, v in r.items()})
+
+# 11. finding quicksilvers 4 and 5 from flask 3
+found = da.find_similar(img, boxes[3], count=2)
+assert len(found) == 2 and abs(found[0][0] - boxes[4][0]) <= 2 and abs(found[1][0] - boxes[5][0]) <= 2, found
+print("auto-find:", found)
+
+# 12. pick modes: 'shape' keeps out the cork/arch; 'box' takes every match in the box
+ref1 = img[boxes[1][1]:boxes[1][1] + boxes[1][3], boxes[1][0]:boxes[1][0] + boxes[1][2]]
+p1 = [(33 - boxes[1][0], 80 - boxes[1][1])]
+shape = da.liquid_selection(ref1, p1, 55, "shape"); anywhere = da.liquid_selection(ref1, p1, 55, "box")
+assert anywhere.sum() >= shape.sum() > 0
+assert not shape[:25].any(), "shape mode picked something in the cork/neck area"
+ref3 = img[boxes[3][1]:boxes[3][1] + boxes[3][3], boxes[3][0]:boxes[3][0] + boxes[3][2]]
+q = da.liquid_selection(ref3, [(140 - boxes[3][0], 95 - boxes[3][1])], 55, "shape")
+rows = np.nonzero(q.any(1))[0]
+assert rows.min() < 50 and rows.max() > 95, (rows.min(), rows.max())   # above AND below the wings
+print("pick modes ok; quicksilver liquid rows", rows.min(), "-", rows.max())
+print("ALL CHECKS PASSED")

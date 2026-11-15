@@ -2,4 +2,3 @@ mss
 numpy
 opencv-python
 pynput
-pillow
