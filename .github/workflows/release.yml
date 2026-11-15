@@ -1,0 +1,46 @@
+# Builds DanielsAssignment.exe on Windows and publishes it as a GitHub Release
+# whenever a version tag (e.g. v1.0.1) is pushed. The app updates itself from these.
+name: Build and release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Stamp version from tag
+        shell: pwsh
+        run: |
+          $v = "${{ github.ref_name }}".TrimStart('v')
+          (Get-Content daniels_assignment.py) -replace '__version__ = ".*"', "__version__ = `"$v`"" |
+            Set-Content daniels_assignment.py
+
+      - name: Install
+        run: pip install -r requirements.txt pyinstaller
+
+      - name: Run checks
+        run: python test_offline.py flasks.png
+
+      - name: Build exe
+        run: >
+          pyinstaller --onefile --windowed --name DanielsAssignment
+          --collect-submodules pynput
+          --hidden-import pynput.keyboard._win32 --hidden-import pynput.mouse._win32
+          daniels_assignment.py
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/DanielsAssignment.exe
+          generate_release_notes: true

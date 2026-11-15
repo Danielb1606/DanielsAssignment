@@ -1,0 +1,112 @@
+"""Offline checks for Daniels Assignment using the user's screenshot."""
+import random, shutil, sys
+from pathlib import Path
+import cv2, numpy as np
+
+sys.path.insert(0, str(Path(__file__).parent))
+import daniels_assignment as da
+
+shutil.rmtree(da.DATA_DIR, ignore_errors=True)
+src = cv2.imread(sys.argv[1] if len(sys.argv) > 1 else "flasks.png")
+# pad below so there is room for timer bars, like the real UI
+img = cv2.copyMakeBorder(src, 0, 40, 0, 0, cv2.BORDER_CONSTANT, value=(5, 5, 5))
+boxes = {1: [8, 8, 50, 118], 2: [68, 12, 52, 112], 3: [126, 4, 58, 124],
+         4: [188, 4, 58, 124], 5: [248, 4, 58, 124]}
+bars = {s: [boxes[s][0], 141 + 6, boxes[s][2], 16] for s in (3, 4, 5)}
+
+cfg = da.default_config()
+points = {1: (33, 80), 2: (93, 85), 3: (140, 95), 4: (202, 95), 5: (262, 95)}
+print("\n".join(da.calibrate_from_image(img, cfg, boxes, bars, points)))
+cfg = da.load_config()
+
+def read(image):
+    return da.FlaskReader(cfg, frame_source=lambda: image).read()
+
+def show(tag, r):
+    print(f"{tag:<34}", "  ".join(f"{k}:{'--' if not v.visible else ('FULL' if v.full else 'not')}"
+                                 f"{'+RUN' if v.active else ''}({v.fill:.0%})" for k, v in r.items()))
+    return r
+
+# 1. all full
+r = show("all full", read(img))
+assert all(v.full and v.visible and not v.active for v in r.values())
+
+# 2. drain life to ~70% and quicksilver 4 to ~50% (paint dark glass over the top)
+d = img.copy()
+m1 = da.model_for(cfg['slots'][0])
+x, y, w, h = boxes[1]; cut = m1.top + int(0.3 * (m1.bottom - m1.top))
+d[y:y + cut, x:x + w][m1.mask[:cut]] = (40, 38, 36)
+m4 = da.model_for(cfg['slots'][3])
+x, y, w, h = boxes[4]; cut = m4.top + int(0.5 * (m4.bottom - m4.top))
+d[y:y + cut, x:x + w][m4.mask[:cut]] = (40, 38, 36)
+r = show("life 70%, qs4 50%", read(d))
+assert not r[1].full and r[2].full and not r[4].full and r[3].full
+
+# 3. timer bars (partial lengths like the user's screenshot)
+b = d.copy()
+for s, length in ((4, 17), (5, 40)):
+    bx, by, bw, bh = bars[s]
+    cv2.rectangle(b, (bx + 2, by + 4), (bx + 2 + length, by + 11), (153, 215, 249), -1)
+cv2.rectangle(b, (bars[3][0] + 2, bars[3][1] + 4), (bars[3][0] + 4, bars[3][1] + 11), (153, 215, 249), -1)  # nearly expired
+r = show("bars on 3 (tiny), 4, 5", read(b))
+assert r[3].active and r[4].active and r[5].active and not r[1].active
+
+fr = da.FlaskReader(cfg, frame_source=lambda: b)
+cv2.imwrite(str(da.DATA_DIR / "test_panel.png"), da.render_panel(cfg, fr, fr.read()))
+
+# 4. belt hidden (loading screen)
+hidden = np.full_like(img, 12)
+r = show("loading screen", read(hidden))
+assert not any(v.visible for v in r.values())
+
+# 5. recalibrate slot 1 with a bigger box (new, larger life flask art)
+big = cv2.copyMakeBorder(img, 0, 0, 0, 0, cv2.BORDER_REPLICATE)
+lines = da.calibrate_from_image(big, cfg, {1: [4, 2, 58, 128]}, {}, {1: (33, 80)})
+print("\n".join(l for l in lines if "Slot 1" in l or "slot 1" in l))
+cfg = da.load_config()
+r = show("after slot 1 recalibrated bigger", read(big))
+assert r[1].full
+
+
+# 6. controller: town mode + quicksilver rotation, with a simulated UI
+class Sim:
+    def __init__(s): s.t = 0.0; s.town = False; s.full = {k: True for k in range(1, 6)}; s.active_until = {k: 0 for k in range(1, 6)}; s.hidden_until = 0; s.refill_at = {}
+    def now(s): return s.t
+    def sleep(s, dt): s.t += dt
+    def read(s):
+        for k, t in list(s.refill_at.items()):
+            if s.t >= t: s.full[k] = True; del s.refill_at[k]
+        vis = s.t >= s.hidden_until
+        return {k: da.SlotReading(vis, s.full[k] and vis, s.t < s.active_until[k] and vis, 1.0, 1.0) for k in range(1, 6)}
+    def press(s, k):
+        s.presses.append((round(s.t, 3), k))
+        if s.town: return True          # key sent, flask does nothing
+        s.full[k] = False; s.refill_at[k] = s.t + (8 if k >= 3 else 3)
+        if k >= 3: s.active_until[k] = s.t + 4
+        return True
+
+sim = Sim(); sim.presses = []
+logs = []
+ctl = da.FlaskController(sim.read, sim.press, clock=sim.now, sleep=sim.sleep, rng=random.Random(2), log=logs.append)
+ctl.run(12)
+qs = [p for p in sim.presses if p[1] >= 3]
+assert all(b[0] - a[0] >= 4 for a, b in zip(qs, qs[1:])), qs
+delays = [float(l.split("in ")[1].split(" ms")[0]) for l in logs if "press in" in l]
+assert all(150 <= d <= 300 for d in delays), delays
+print(f"\nfield: {len(sim.presses)} presses, quicksilver presses at {[p[0] for p in qs]}, delays {min(delays):.0f}-{max(delays):.0f} ms")
+
+# enter town: flasks refill and stop working
+sim.town = True
+for k in range(1, 6): sim.full[k] = True; sim.active_until[k] = 0
+sim.refill_at.clear()
+n0 = len(sim.presses)
+ctl.run(10)
+print("town:", [l for l in logs if "TOWN" in l], f"presses in town: {len(sim.presses) - n0}")
+assert ctl.town_mode and len(sim.presses) - n0 <= 3
+
+# leave town via loading screen
+sim.town = False; sim.hidden_until = sim.t + 2
+ctl.run(6)
+print("after area change:", [l for l in logs if "TOWN MODE OFF" in l], f"town_mode={ctl.town_mode}")
+assert not ctl.town_mode and len(sim.presses) > n0 + 3
+print("\nALL CHECKS PASSED")
