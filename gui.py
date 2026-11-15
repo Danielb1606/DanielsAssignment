@@ -58,6 +58,7 @@ def button(parent, text, cmd, kind="normal", **kw):
         "normal": (PANEL_2, TEXT, "#3a3128"),
         "primary": (GOLD, "#1a140c", "#dcb873"),
         "danger": (RED, "white", "#d9605a"),
+        "go": (GREEN, "white", "#4fc46b"),
         "ghost": (PANEL, MUTED, PANEL_2),
     }[kind]
     b = tk.Label(parent, text=text, bg=colours[0], fg=colours[1], font=kw.pop("font", H_FONT),
@@ -87,7 +88,8 @@ def button(parent, text, cmd, kind="normal", **kw):
 def set_button(b, text=None, kind=None, enabled=None):
     if kind:
         b._colours = {"normal": (PANEL_2, TEXT, "#3a3128"), "primary": (GOLD, "#1a140c", "#dcb873"),
-                      "danger": (RED, "white", "#d9605a"), "ghost": (PANEL, MUTED, PANEL_2)}[kind]
+                      "danger": (RED, "white", "#d9605a"), "ghost": (PANEL, MUTED, PANEL_2),
+                      "go": (GREEN, "white", "#4fc46b")}[kind]
     if text is not None:
         b.config(text=text)
     if enabled is not None:
@@ -139,8 +141,21 @@ class Engine:
             self.error = str(e.code)
             return
         self.error = None
+        try:
+            self._start(mode, cfg, reader, loc)
+        except Exception as e:
+            import traceback
+            tb = traceback.extract_tb(e.__traceback__)[-1]
+            self.error = f"Couldn't start: {e.__class__.__name__}: {e} ({tb.name}, line {tb.lineno})"
+            self.log(self.error)
+            self.stop_flag.set()
+            self.controller = None
+            self.reader = None
+            self.thread = None
+            self.mode = "idle"
+
+    def _start(self, mode, cfg, reader, loc) -> None:
         self.stop_flag.clear()
-        self.mode = mode
         self.reader = reader
         settings = core.get_settings(cfg)
         self.poll_interval = 1.0 / settings["checks_per_second"]
@@ -149,12 +164,15 @@ class Engine:
             args = (reader,)
         else:
             sender = core.KeySender(cfg, loc)
+            if getattr(sender, "fallback_reason", ""):
+                self.log(f"Key sending: using the fallback method ({sender.fallback_reason}).")
             self.controller = core.FlaskController(
                 lambda: self._read_and_store(reader), sender, log=self.log, settings=settings)
             self.controller.on_town = lambda on: self.log_q.put("__TOWN_ON__" if on else "__TOWN_OFF__")
             target = self._run_loop
             args = ()
         self.thread = threading.Thread(target=target, args=args, daemon=True)
+        self.mode = mode
         self.thread.start()
 
     def _close_capture(self, reader) -> None:
@@ -1059,7 +1077,7 @@ class CompactBar(tk.Toplevel):
             c.create_text(x + d / 2, y + d / 2, text=str(slot), fill="white", font=("Segoe UI Semibold", 9))
         self.status.config(text=status, fg=colour)
         set_button(self.run_btn, text="■" if mode == "run" else "▶",
-                   kind="danger" if mode == "run" else "primary",
+                   kind="danger" if mode == "run" else "go",
                    enabled=mode == "run" or self.app.can_start())
 
     def flash(self, colour: str, times: int = 6):
@@ -1088,6 +1106,7 @@ class App(tk.Tk):
         self._tick_n = 0
         self._style()
         self._build()
+        self.report_callback_exception = self._ui_error
         self.refresh_cards_idle()
         self.after(250, self._tick)
         self.hotkeys = core.HotkeyListener(core.get_settings(self.cfg),
@@ -1196,7 +1215,7 @@ class App(tk.Tk):
         self.test_btn.pack(side="left", padx=10)
         self.town_btn = button(ctl, "Leave town mode", self._leave_town, kind="ghost")
         self.pause_btn = button(ctl, "Pause", self._toggle_pause, kind="ghost")
-        self.run_btn = button(ctl, "▶  Start", self.toggle_run, kind="primary", font=("Segoe UI Semibold", 13),
+        self.run_btn = button(ctl, "▶  Start", self.toggle_run, kind="go", font=("Segoe UI Semibold", 13),
                               padx=26, pady=9)
         self.run_btn.pack(side="right")
         self.pause_btn.pack(side="right", padx=8)
@@ -1269,7 +1288,7 @@ class App(tk.Tk):
                    kind="danger" if mode == "test" else "normal", enabled=ready and mode != "run")
         has_window = bool(self.cfg.get("window_title"))
         set_button(self.run_btn, text="■  Stop" if mode == "run" else "▶  Start",
-                   kind="danger" if mode == "run" else "primary",
+                   kind="danger" if mode == "run" else "go",
                    enabled=(ready and has_window and mode != "test" and not self._resized) or mode == "run")
         if mode == "run":
             self.pause_btn.pack(side="right", padx=8)
@@ -1549,6 +1568,19 @@ class App(tk.Tk):
         except Exception:
             pass
 
+    def _ui_error(self, exc, val, tb):
+        import traceback
+        where = traceback.extract_tb(tb)[-1] if tb else None
+        msg = f"Something went wrong: {exc.__name__}: {val}"
+        if where:
+            msg += f"  ({where.name}, line {where.lineno})"
+        self.write_log(msg)
+        try:
+            messagebox.showerror(core.APP, msg + "\n\nPlease send a screenshot of this to get it fixed.")
+        except Exception:
+            pass
+        self._update_buttons()
+
     def _hotkey(self, name: str):
         if name == "hotkey_toggle":
             if self.engine.mode == "test":
@@ -1619,6 +1651,9 @@ class App(tk.Tk):
             else:
                 self.write_log(msg)
         mode = self.engine.mode
+        if mode != getattr(self, "_last_mode", None):
+            self._last_mode = mode
+            self._update_buttons()
         if mode == "idle":
             self._set_status("Idle", MUTED)
             self.town_btn.pack_forget()

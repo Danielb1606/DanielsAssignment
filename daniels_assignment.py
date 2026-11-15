@@ -57,7 +57,7 @@ RECENT_ERRORS: "collections.deque[str]" = collections.deque(maxlen=20)   # for "
 def note_error(where: str) -> None:
     """Remember the current exception (with its full traceback) for diagnostics."""
     RECENT_ERRORS.append(f"[{time.strftime('%H:%M:%S')}] {where}\n{traceback.format_exc()}")
-__version__ = "1.4.0"
+__version__ = "1.4.1"
 # Saved next to the .exe when packaged (a one-file .exe unpacks itself to a
 # temporary folder, so __file__ would point somewhere that gets deleted).
 _BASE = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
@@ -1000,7 +1000,8 @@ class FlaskController:
                     self.poll()
                 except Exception as e:           # keep going; report once per kind of error
                     note_error("controller check")
-                    msg = f"Error while reading the flasks: {e}"
+                    tb = traceback.extract_tb(e.__traceback__)[-1]
+                    msg = f"Error while reading the flasks: {e.__class__.__name__}: {e} ({tb.name}, line {tb.lineno})"
                     if msg != getattr(self, "_last_error", None):
                         self._last_error = msg
                         self.log(msg)
@@ -1102,9 +1103,14 @@ class KeySender:
         self.locator = locator
         self.rng = rng or random.Random()
         self.win = sys.platform == "win32" and self.method != "typed"
+        self.fallback_reason = ""
         if self.win:
-            self._setup_win()
-        else:
+            try:
+                self._setup_win()
+            except Exception as e:                       # fall back rather than fail to start
+                self.win = False
+                self.fallback_reason = f"{e.__class__.__name__}: {e}"
+        if not self.win:
             from pynput.keyboard import Controller
             self.kb = Controller()
 
