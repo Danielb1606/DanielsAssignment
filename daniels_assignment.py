@@ -50,7 +50,7 @@ import cv2
 import numpy as np
 
 APP = "Daniels Assignment"
-__version__ = "1.3.3"
+__version__ = "1.3.4"
 # Saved next to the .exe when packaged (a one-file .exe unpacks itself to a
 # temporary folder, so __file__ would point somewhere that gets deleted).
 _BASE = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
@@ -336,6 +336,8 @@ class SlotReading:
 
 
 DEFAULT_SIMILARITY = 55   # calibration slider default (1-100)
+SAT_FLOOR = 55            # never count washed-out (grey) pixels as liquid
+VAL_FLOOR = 30            # ...or near-black ones
 PICK_MODES = ("shape", "box")
 
 
@@ -356,8 +358,10 @@ def colour_match(hsv: np.ndarray, seeds: List[Tuple[int, float, float]], similar
     H, S, V = (hsv[..., i].astype(np.int16) for i in range(3))
     out = np.zeros(H.shape, bool)
     for h0, s0, v0 in seeds:
-        out |= ((_circ_hue_dist(H, h0) <= hue_tol) & (S >= s0 * (1 - 0.85 * f))
-                & (V >= v0 * (1 - 0.9 * f)))
+        # each click sets its own limits, so a click on a dark edge lets darker
+        # liquid in; the floors stop grey glass ever counting as liquid
+        out |= ((_circ_hue_dist(H, h0) <= hue_tol) & (S >= max(SAT_FLOOR, s0 * (1 - 0.85 * f)))
+                & (V >= max(VAL_FLOOR, v0 * (1 - 0.9 * f))))
     return out
 
 
@@ -375,14 +379,22 @@ def liquid_selection(ref_bgr: np.ndarray, points: List[Tuple[int, int]],
         return np.zeros((h, w), bool)
     hsv = cv2.cvtColor(ref_bgr, cv2.COLOR_BGR2HSV)
     match = colour_match(hsv, [_seed(hsv, x, y) for x, y in pts], similarity)
-    match = cv2.morphologyEx(match.astype(np.uint8), cv2.MORPH_OPEN, np.ones((2, 2), np.uint8)) > 0
+    # (no speck-removal filter here: it also deleted the thin 1-2 px liquid
+    # along the glass edge; small loose specks are dropped below instead)
     n, lab, stats, _ = cv2.connectedComponentsWithStats(match.astype(np.uint8), connectivity=8)
-    clicked = {int(lab[y, x]) for x, y in pts if lab[y, x] > 0}
+    clicked = set()
+    for x, y in pts:                     # the piece under (or right next to) each click
+        win = lab[max(0, y - 3):y + 4, max(0, x - 3):x + 4]
+        ids = win[win > 0]
+        if ids.size:
+            clicked.add(int(np.bincount(ids).argmax()))
     keep = np.zeros(n, bool)
     for i in range(1, n):
         x0, y0, bw, bh, area = stats[i]
         touches_edge = x0 == 0 or y0 == 0 or x0 + bw >= w or y0 + bh >= h
-        if i in clicked or (area >= 0.004 * h * w and (mode == "box" or not touches_edge)):
+        if mode == "box":
+            keep[i] = i in clicked or area >= 5          # everything except loose specks
+        elif i in clicked or (area >= 0.004 * h * w and not touches_edge):
             keep[i] = True
     sel = keep[lab]
     if mode == "box" or not sel.any():
@@ -439,16 +451,26 @@ class SlotModel:
         else:
             self.hue = 0
 
-        rows = self.mask.sum(1)
+        # FULL is judged on the body of the liquid: thin 1-2 px strips along the
+        # glass (or a thin rim at the top) are part of the pink area but are too
+        # fragile to judge by
+        core = cv2.erode(self.mask.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
+        if core.sum() < 0.5 * self.mask.sum():
+            core = self.mask
+        rows = core.sum(1)
         if rows.max() == 0:
             self.top = self.bottom = 0
         else:
             good = np.nonzero(rows >= max(2, 0.15 * rows.max()))[0]
             self.top, self.bottom = int(good.min()), int(good.max())
         band_h = max(3, int(round(TOP_BAND_FRAC * (self.bottom - self.top + 1))))
-        self.band = self.mask.copy()
+        self.band = core.copy()
         self.band[: self.top] = False
         self.band[self.top + band_h:] = False
+        if self.band.sum() < 15:                     # very thin liquid: fall back to all of it
+            self.band = self.mask.copy()
+            self.band[: self.top] = False
+            self.band[self.top + band_h:] = False
 
         grown = cv2.dilate(self.mask.astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
         self.frame = ~grown

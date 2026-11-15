@@ -171,8 +171,9 @@ hsv = cv2.cvtColor(sh, cv2.COLOR_BGR2HSV).astype(int)
 for slot in range(1, 6):
     sc = da.slot_cfg(cfg4, slot); m = da.model_for(sc); x, y, w, h = sc["box"]
     sub = hsv[y:y + h, x:x + w]
-    moved = np.roll(sub, 2, axis=1)                                   # texture moves 2 px
-    sub[m.mask] = moved[m.mask]
+    moved = np.roll(sub, 2, axis=1)                                   # texture moves 2 px...
+    inside = m.mask & np.roll(m.mask, 2, axis=1)                      # ...within the liquid
+    sub[inside] = moved[inside]
     sub[..., 0][m.mask] = (sub[..., 0][m.mask] + rng.integers(-4, 5, m.mask.sum())) % 180
     sub[..., 2][m.mask] = np.clip(sub[..., 2][m.mask] * rng.uniform(0.8, 1.15, m.mask.sum()), 0, 255)
 sh = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
@@ -275,4 +276,16 @@ ks = da.KeySender.__new__(da.KeySender); ks.hold_range = (0.02, 0.09); ks.rng = 
 holds = [ks.hold_time() for _ in range(500)]
 assert 0.02 <= min(holds) and max(holds) <= 0.09 and max(holds) - min(holds) > 0.05
 print(f"key hold random {min(holds)*1000:.0f}-{max(holds)*1000:.0f} ms")
+print("ALL CHECKS PASSED")
+
+# 18. mana flask edges: loosening picks up the thin blue edge, never grey glass
+mb = [66, 3, 57, 127]; refm = img[mb[1]:mb[1] + mb[3], mb[0]:mb[0] + mb[2]]
+hsvm = cv2.cvtColor(refm, cv2.COLOR_BGR2HSV); Hm, Sm, Vm = (hsvm[..., i].astype(int) for i in range(3))
+obvious = (da._circ_hue_dist(Hm, 112) <= 18) & (Sm >= 70) & (Vm >= 50)
+for clicks in ([(27, 70)], [(27, 70), (14, 53), (19, 44), (22, 41), (24, 40), (34, 47)]):
+    for sim in (55, 75, 95):
+        m = da.liquid_selection(refm, clicks, sim, "shape")
+        assert int((m & (Sm < 50)).sum()) == 0, (clicks, sim)
+    assert int((obvious & ~m).sum()) < 0.01 * obvious.sum(), int((obvious & ~m).sum())
+print("mana edges: no grey glass at any setting; loose setting gets the blue edge")
 print("ALL CHECKS PASSED")
