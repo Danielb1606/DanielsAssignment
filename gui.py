@@ -2698,17 +2698,42 @@ def _clean_notes(notes: str) -> str:
 
 
 def _set_icon(root) -> None:
-    """Red flask icon for the title bar and taskbar (every size, so it's sharp)."""
-    base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)) / "assets"
+    """Red flask for the title bar and taskbar. Windows is handed the exact-size
+    icons for this screen's scale, so it never shrinks a big picture and blurs it."""
+    ico = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)) / "assets" / "icon.ico"
     try:
-        root.iconbitmap(default=str(base / "icon.ico"))
+        root.iconbitmap(default=str(ico))
     except tk.TclError:
         pass
-    try:
-        root._icons = [tk.PhotoImage(file=str(base / n)) for n in ("icon.png", "icon48.png", "icon32.png", "icon16.png")]
-        root.iconphoto(True, *root._icons)
-    except tk.TclError:
-        pass
+    if sys.platform != "win32":
+        return
+
+    def apply():
+        try:
+            import ctypes
+            from ctypes import wintypes
+            u32 = ctypes.windll.user32
+            hwnd = int(root.wm_frame(), 16)
+            try:
+                dpi = u32.GetDpiForWindow(hwnd) or 96
+                big, small = u32.GetSystemMetricsForDpi(11, dpi), u32.GetSystemMetricsForDpi(49, dpi)
+            except AttributeError:
+                big, small = u32.GetSystemMetrics(11), u32.GetSystemMetrics(49)
+            u32.LoadImageW.restype = wintypes.HANDLE
+            u32.LoadImageW.argtypes = [wintypes.HINSTANCE, wintypes.LPCWSTR, wintypes.UINT, ctypes.c_int,
+                                       ctypes.c_int, wintypes.UINT]
+            u32.SendMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+            hb = u32.LoadImageW(None, str(ico), 1, big, big, 0x10)
+            hs = u32.LoadImageW(None, str(ico), 1, small, small, 0x10)
+            if hb:
+                u32.SendMessageW(hwnd, 0x80, 1, hb)
+            if hs:
+                u32.SendMessageW(hwnd, 0x80, 0, hs)
+            root._win_icons = (hb, hs)
+        except Exception:
+            pass
+
+    root.after(50, apply)
 
 
 def launch():
