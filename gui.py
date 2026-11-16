@@ -246,6 +246,51 @@ class Engine:
             self.trig_crops = {}
 
 
+class Loupe:
+    """Magnifier for picking colours: shows the pixels around the cursor large,
+    with the exact pixel that a click would pick outlined, and its colour."""
+    R = 7            # pixels each side of the centre
+    Z = 10           # size of each pixel in the magnifier
+
+    def __init__(self, canvas: tk.Canvas, get_img, to_img, active):
+        self.c, self.get_img, self.to_img, self.active = canvas, get_img, to_img, active
+        self._photo = None
+        canvas.bind("<Motion>", self._move, add="+")
+        canvas.bind("<Leave>", lambda e: self.hide(), add="+")
+
+    def hide(self):
+        self.c.delete("loupe")
+
+    def _move(self, e):
+        self.hide()
+        if not self.active():
+            return
+        img = self.get_img()
+        ix, iy = self.to_img(e.x, e.y)
+        h, w = img.shape[:2]
+        if not (0 <= ix < w and 0 <= iy < h):
+            return
+        R, Z = self.R, self.Z
+        pad = cv2.copyMakeBorder(img, R, R, R, R, cv2.BORDER_CONSTANT, value=(12, 10, 8))
+        crop = pad[iy:iy + 2 * R + 1, ix:ix + 2 * R + 1]
+        size = (2 * R + 1) * Z
+        self._photo = to_photo(crop, size, size)
+        cw, ch = int(self.c.cget("width")), int(self.c.cget("height"))
+        # sit in the corner furthest from the cursor so it never covers what you're aiming at
+        x0 = 8 if e.x > cw / 2 else max(8, cw - size - 8)
+        y0 = 8 if e.y > ch / 2 else max(8, ch - size - 34)
+        self.c.create_rectangle(x0 - 3, y0 - 3, x0 + size + 3, y0 + size + 29, fill="#0c0a08", outline=GOLD,
+                                width=2, tags="loupe")
+        self.c.create_image(x0, y0, image=self._photo, anchor="nw", tags="loupe")
+        cx, cy = x0 + R * Z, y0 + R * Z
+        self.c.create_rectangle(cx, cy, cx + Z, cy + Z, outline="#ffffff", width=2, tags="loupe")
+        self.c.create_rectangle(cx - 1, cy - 1, cx + Z + 1, cy + Z + 1, outline="#000000", width=1, tags="loupe")
+        b, g, r = (int(v) for v in img[iy, ix])
+        self.c.create_rectangle(x0, y0 + size + 6, x0 + 20, y0 + size + 24, fill=f"#{r:02x}{g:02x}{b:02x}",
+                                outline=BORDER, tags="loupe")
+        self.c.create_text(x0 + 28, y0 + size + 15, text="this pixel", anchor="w", fill=TEXT, font=SMALL, tags="loupe")
+
+
 # ================================================================ flask card
 class FlaskCard(tk.Frame):
     def __init__(self, parent, slot: int, kind: str, on_recal, on_kind=None):
@@ -468,6 +513,8 @@ class CalibrationDialog(tk.Toplevel):
         self.canvas.bind("<ButtonPress-1>", self._down)
         self.canvas.bind("<B1-Motion>", self._drag)
         self.canvas.bind("<ButtonRelease-1>", self._up)
+        Loupe(self.canvas, lambda: self.img, self._to_img,
+              lambda: self.steps[self.i][0] == "liquid")
 
         # liquid controls (only on liquid steps)
         self.liq_frame = tk.Frame(self, bg=PANEL, highlightthickness=1, highlightbackground=BORDER)
@@ -1029,6 +1076,7 @@ class TriggerCalibDialog(tk.Toplevel):
         self.canvas.bind("<ButtonPress-1>", self._down)
         self.canvas.bind("<B1-Motion>", self._drag)
         self.canvas.bind("<ButtonRelease-1>", self._up)
+        Loupe(self.canvas, lambda: self.img, self._to_img, lambda: self.step == "pick")
         self.ctrl = tk.Frame(self, bg=PANEL, highlightthickness=1, highlightbackground=BORDER)
         r1 = tk.Frame(self.ctrl, bg=PANEL)
         r1.pack(fill="x", padx=12, pady=(8, 2))
