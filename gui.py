@@ -309,13 +309,13 @@ class HandFix:
         row.pack(fill="x", padx=12, pady=(0, 8))
         tk.Label(row, text="Fix by hand", bg=PANEL, fg=GOLD, font=H_FONT, width=10, anchor="w").pack(side="left")
         for val, label in self.TOOLS:
-            tk.Radiobutton(row, text=label, value=val, variable=self.tool, bg=PANEL, fg=TEXT, selectcolor=PANEL_2,
-                           activebackground=PANEL, activeforeground=TEXT, font=FONT, highlightthickness=0,
-                           indicatoron=False, padx=8, pady=2, relief="flat", offrelief="flat",
+            tk.Radiobutton(row, text=label, value=val, variable=self.tool, bg=PANEL, fg=TEXT, selectcolor="#6b5222",
+                           activebackground=PANEL_2, activeforeground=TEXT, font=FONT, highlightthickness=0,
+                           indicatoron=False, padx=8, pady=2, relief="flat", offrelief="flat", cursor="hand2",
                            command=lambda: self.on_change(False)).pack(side="left", padx=(0, 4))
         tk.Label(row, text="Brush", bg=PANEL, fg=MUTED, font=SMALL).pack(side="left", padx=(10, 4))
         for n in (1, 2, 3):
-            tk.Radiobutton(row, text=f"{n}px", value=n, variable=self.size, bg=PANEL, fg=TEXT, selectcolor=PANEL_2,
+            tk.Radiobutton(row, text=f"{n}px", value=n, variable=self.size, bg=PANEL, fg=TEXT, selectcolor="#6b5222",
                            activebackground=PANEL, activeforeground=TEXT, font=SMALL, highlightthickness=0,
                            indicatoron=False, padx=5, pady=1, relief="flat", offrelief="flat").pack(side="left")
         self.clear_btn = button(row, "Clear fixes", self.clear, kind="ghost", font=SMALL, pady=2)
