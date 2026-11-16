@@ -291,6 +291,77 @@ class Loupe:
         self.c.create_text(x0 + 28, y0 + size + 15, text="this pixel", anchor="w", fill=TEXT, font=SMALL, tags="loupe")
 
 
+class HandFix:
+    """Optional hand fixes on top of a colour pick: paint pixels in or out with a
+    brush (click and hold), or with a box. Fixes are kept per area as an array:
+    0 = as picked, 1 = always included, 2 = always left out."""
+    TOOLS = (("pick", "Click colour"), ("add", "Paint in"), ("remove", "Paint out"),
+             ("box_add", "Box in"), ("box_remove", "Box out"))
+
+    def __init__(self, parent, on_change):
+        self.on_change = on_change
+        self.edits: Optional[np.ndarray] = None
+        self.tool = tk.StringVar(value="pick")
+        self.size = tk.IntVar(value=1)
+        row = tk.Frame(parent, bg=PANEL)
+        row.pack(fill="x", padx=12, pady=(0, 8))
+        tk.Label(row, text="Fix by hand", bg=PANEL, fg=GOLD, font=H_FONT, width=10, anchor="w").pack(side="left")
+        for val, label in self.TOOLS:
+            tk.Radiobutton(row, text=label, value=val, variable=self.tool, bg=PANEL, fg=TEXT, selectcolor=PANEL_2,
+                           activebackground=PANEL, activeforeground=TEXT, font=FONT, highlightthickness=0,
+                           indicatoron=False, padx=8, pady=2, relief="flat", offrelief="flat",
+                           command=lambda: self.on_change(False)).pack(side="left", padx=(0, 4))
+        tk.Label(row, text="Brush", bg=PANEL, fg=MUTED, font=SMALL).pack(side="left", padx=(10, 4))
+        for n in (1, 2, 3):
+            tk.Radiobutton(row, text=f"{n}px", value=n, variable=self.size, bg=PANEL, fg=TEXT, selectcolor=PANEL_2,
+                           activebackground=PANEL, activeforeground=TEXT, font=SMALL, highlightthickness=0,
+                           indicatoron=False, padx=5, pady=1, relief="flat", offrelief="flat").pack(side="left")
+        self.clear_btn = button(row, "Clear fixes", self.clear, kind="ghost", font=SMALL, pady=2)
+        self.clear_btn.pack(side="right")
+        self._box0 = None
+
+    @property
+    def painting(self) -> bool:
+        return self.tool.get() != "pick"
+
+    def ensure(self, shape):
+        if self.edits is None or self.edits.shape != tuple(shape[:2]):
+            self.edits = np.zeros(shape[:2], np.uint8)
+
+    def brush(self, ix: int, iy: int):
+        if self.edits is None:
+            return
+        val = core.EDIT_ADD if self.tool.get() == "add" else core.EDIT_REMOVE
+        r = self.size.get() - 1
+        h, w = self.edits.shape
+        self.edits[max(0, iy - r):min(h, iy + r + 1), max(0, ix - r):min(w, ix + r + 1)] = val
+
+    def rect(self, a: int, b: int, c: int, d: int):
+        if self.edits is None:
+            return
+        val = core.EDIT_ADD if self.tool.get() == "box_add" else core.EDIT_REMOVE
+        h, w = self.edits.shape
+        self.edits[max(0, b):min(h, d + 1), max(0, a):min(w, c + 1)] = val
+
+    def clear(self):
+        if self.edits is not None:
+            self.edits[:] = 0
+        self.on_change(True)
+
+    def result(self) -> Optional[np.ndarray]:
+        return self.edits.copy() if self.edits is not None and self.edits.any() else None
+
+
+def shade_removed(crop: np.ndarray, edits: Optional[np.ndarray]) -> np.ndarray:
+    """Darken pixels you painted out, so you can see them."""
+    if edits is None or edits.shape != crop.shape[:2]:
+        return crop
+    out = crop.copy()
+    rem = edits == core.EDIT_REMOVE
+    out[rem] = (out[rem] * 0.3 + np.array([30, 30, 150]) * 0.7).astype(np.uint8)
+    return out
+
+
 # ================================================================ flask card
 class FlaskCard(tk.Frame):
     def __init__(self, parent, slot: int, kind: str, on_recal, on_kind=None):
@@ -543,6 +614,8 @@ class CalibrationDialog(tk.Toplevel):
                            highlightthickness=0, command=self._on_liquid_setting).pack(side="left", padx=(0, 14))
         self.undo_btn = button(r2, "Undo click", self._undo_click, kind="ghost", font=SMALL, pady=3)
         self.undo_btn.pack(side="right")
+        self.fix = HandFix(self.liq_frame, self._fix_changed)
+        self.edit_store: Dict[int, Optional[np.ndarray]] = {}
 
         bar = tk.Frame(self, bg=BG)
         bar.pack(fill="x", padx=16, pady=(4, 14), side="bottom")
@@ -561,11 +634,12 @@ class CalibrationDialog(tk.Toplevel):
         self.focus_set()
 
     # -- view helpers -------------------------------------------------------
-    def _set_view(self, region: Tuple[int, int, int, int], overlay: Optional[np.ndarray] = None) -> None:
+    def _set_view(self, region: Tuple[int, int, int, int], overlay: Optional[np.ndarray] = None,
+                  removed: Optional[np.ndarray] = None) -> None:
         """Show part of the screenshot (x, y, w, h) scaled to the canvas,
-        optionally with a mask shaded pink."""
+        optionally with a mask shaded pink (and painted-out pixels darkened)."""
         x, y, w, h = region
-        crop = self.img[y:y + h, x:x + w]
+        crop = shade_removed(self.img[y:y + h, x:x + w], removed)
         if overlay is not None and overlay.any():
             crop = crop.copy()
             crop[overlay] = (crop[overlay] * 0.35 + np.array([255, 0, 255]) * 0.65).astype(np.uint8)
@@ -665,11 +739,32 @@ class CalibrationDialog(tk.Toplevel):
         if last and kind in ("bar", "liquid"):
             set_button(self.next_btn, text="Finish  ✓")
 
+    def _edits(self, slot):
+        """Hand fixes for this flask (sized to its box)."""
+        x, y, w, h = self.boxes[slot]
+        e = self.edit_store.get(slot)
+        if e is None or e.shape != (h, w):
+            e = None
+            old = core.slot_cfg(self.cfg, slot).get("box")
+            if old and list(old) == list(self.boxes[slot]):     # same box as last time: keep its fixes
+                e = core.load_edits(f"slot{slot}", (h, w))
+            if e is None and slot in self.preset and self.preset[slot].get("edits") is not None:
+                e = self.preset[slot]["edits"]
+            e = e.copy() if e is not None and e.shape == (h, w) else np.zeros((h, w), np.uint8)
+            self.edit_store[slot] = e
+        return e
+
     def _liquid(self, slot):
         x, y, w, h = self.boxes[slot]
         rel = [(px - x, py - y) for px, py in self.points.get(slot, [])]
         st = self.liq[slot]
-        return core.liquid_selection(self.img[y:y + h, x:x + w], rel, st["similarity"], st["mode"])
+        return core.apply_edits(core.liquid_selection(self.img[y:y + h, x:x + w], rel, st["similarity"], st["mode"]),
+                                self._edits(slot))
+
+    def _fix_changed(self, redraw=True):
+        kind, slot = self.steps[self.i]
+        if kind == "liquid" and redraw:
+            self._show_liquid(slot)
 
     def _slider_moved(self, v):
         val = int(round(float(v)))
@@ -689,7 +784,8 @@ class CalibrationDialog(tk.Toplevel):
     def _show_liquid(self, slot):
         name = KIND_LABEL[core.slot_kinds(self.cfg)[slot]].lower()
         mask = self._liquid(slot)
-        self._set_view(tuple(self.boxes[slot]), overlay=mask)
+        self.fix.edits = self._edits(slot)
+        self._set_view(tuple(self.boxes[slot]), overlay=mask, removed=self.fix.edits)
         for px, py in self.points.get(slot, []):
             cx, cy = (px - self.view[0]) * self.scale, (py - self.view[1]) * self.scale
             self.canvas.create_oval(cx - 5, cy - 5, cx + 5, cy + 5, outline=YELLOW, width=2)
@@ -702,7 +798,8 @@ class CalibrationDialog(tk.Toplevel):
         else:
             text = (f"Pink = the liquid it will watch ({share:.0%} of the box). Slide Similarity until the pink "
                     "covers the liquid - including its top edge - but not the glass, label or decorations. "
-                    "Click any patch it still misses.")
+                    "Click any patch it still misses. To fix single pixels, use Fix by hand: Paint in / Paint out "
+                    "(click and hold), or Box in / Box out (drag a box).")
         self.instr.config(text=text)
         set_button(self.undo_btn, enabled=bool(self.points.get(slot)))
         set_button(self.next_btn, enabled=share >= 0.03)
@@ -731,14 +828,29 @@ class CalibrationDialog(tk.Toplevel):
         if kind == "find":
             return
         if kind == "liquid":
-            self.points.setdefault(slot, []).append(self._to_img(e.x, e.y))
-            self._show_liquid(slot)
-            return
+            if not self.fix.painting:
+                self.points.setdefault(slot, []).append(self._to_img(e.x, e.y))
+                self._show_liquid(slot)
+                return
+            if self.fix.tool.get() in ("add", "remove"):
+                self._paint_at(slot, e)
+                return
         self._drag_start = (e.x, e.y)
         self.canvas.delete("sel")
         self._rect = self.canvas.create_rectangle(e.x, e.y, e.x, e.y, outline=YELLOW, width=2, tags="sel")
 
+    def _paint_at(self, slot, e):
+        ix, iy = self._to_img(e.x, e.y)
+        x, y, w, h = self.boxes[slot]
+        self.fix.edits = self._edits(slot)
+        self.fix.brush(ix - x, iy - y)
+        self._show_liquid(slot)
+
     def _drag(self, e):
+        kind, slot = self.steps[self.i]
+        if kind == "liquid" and self.fix.tool.get() in ("add", "remove"):
+            self._paint_at(slot, e)
+            return
         if self._drag_start and self._rect:
             x0, y0 = self._drag_start
             self.canvas.coords(self._rect, x0, y0, e.x, e.y)
@@ -750,6 +862,13 @@ class CalibrationDialog(tk.Toplevel):
         self._drag_start = None
         a, b = self._to_img(min(x0, e.x), min(y0, e.y))
         c, d = self._to_img(max(x0, e.x), max(y0, e.y))
+        kind, slot = self.steps[self.i]
+        if kind == "liquid":                        # Box in / Box out
+            x, y, w, h = self.boxes[slot]
+            self.fix.edits = self._edits(slot)
+            self.fix.rect(a - x, b - y, c - x, d - y)
+            self._show_liquid(slot)
+            return
         if c - a < 4 or d - b < 4:
             self.canvas.delete("sel")
             return
@@ -776,6 +895,11 @@ class CalibrationDialog(tk.Toplevel):
         else:
             self.bars[slot] = self._pending_box
         if self.i == len(self.steps) - 1:
+            for sl in self.boxes:
+                if sl in self.liq:
+                    e = self.edit_store.get(sl)
+                    self.liq[sl]["edits"] = e.copy() if e is not None and e.any() and \
+                        e.shape == (self.boxes[sl][3], self.boxes[sl][2]) else None
             self.result = (self.boxes, self.bars, self.points, self.liq)
             self.destroy()
             return
@@ -914,6 +1038,7 @@ class ReviewDialog(tk.Toplevel):
         boxes, bars, points, liq = dlg.result
         self.entries[slot] = {"box": boxes[slot], "points": points.get(slot, []),
                               "similarity": liq[slot]["similarity"], "mode": liq[slot]["mode"],
+                              "edits": liq[slot].get("edits"),
                               "bar_box": bars.get(slot) if core.slot_kinds(self.cfg).get(slot) in core.BAR_KINDS else None,
                               "unsure": False, "source": "you"}
         self._render()
@@ -928,7 +1053,8 @@ class ReviewDialog(tk.Toplevel):
         boxes = {s: e["box"] for s, e in self.entries.items()}
         bars = {s: e["bar_box"] for s, e in self.entries.items() if core.slot_kinds(self.cfg).get(s) in core.BAR_KINDS and e.get("bar_box")}
         points = {s: e.get("points", []) for s, e in self.entries.items()}
-        liq = {s: {"similarity": e["similarity"], "mode": e["mode"]} for s, e in self.entries.items()}
+        liq = {s: {"similarity": e["similarity"], "mode": e["mode"], "edits": e.get("edits")}
+               for s, e in self.entries.items()}
         self.result = (boxes, bars, points, liq)
         self.destroy()
 
@@ -1051,9 +1177,11 @@ class TriggerEditDialog(tk.Toplevel):
 class TriggerCalibDialog(tk.Toplevel):
     """Draw a box around the area to watch, then click the colour (with the Similarity slider)."""
 
-    def __init__(self, parent, img: np.ndarray, trig: dict):
+    def __init__(self, parent, img: np.ndarray, trig: dict, edits_key: Optional[str] = None):
         super().__init__(parent, bg=BG)
         self.title(f"{core.APP} | {trig['name']}")
+        self.edits_key = edits_key
+        self._old_box = list(trig["box"]) if trig.get("box") else None
         self.transient(parent)
         self.grab_set()
         self.img, self.t = img, trig
@@ -1098,6 +1226,7 @@ class TriggerCalibDialog(tk.Toplevel):
                            command=self._render).pack(side="left", padx=(0, 14))
         self.undo = button(r2, "Undo click", self._undo, kind="ghost", font=SMALL, pady=3)
         self.undo.pack(side="right")
+        self.fix = HandFix(self.ctrl, lambda redraw=True: redraw and self._render())
         bar = tk.Frame(self, bg=BG)
         bar.pack(fill="x", padx=16, pady=(4, 14), side="bottom")
         button(bar, "Cancel", self.destroy, kind="ghost").pack(side="left")
@@ -1115,9 +1244,9 @@ class TriggerCalibDialog(tk.Toplevel):
         x, y, w, h = b
         return x >= 0 and y >= 0 and x + w <= self.img.shape[1] and y + h <= self.img.shape[0]
 
-    def _show(self, region, overlay=None):
+    def _show(self, region, overlay=None, removed=None):
         x, y, w, h = region
-        crop = self.img[y:y + h, x:x + w].copy()
+        crop = shade_removed(self.img[y:y + h, x:x + w], removed).copy()
         if overlay is not None and overlay.any():
             crop[overlay] = (crop[overlay] * 0.35 + np.array([255, 0, 255]) * 0.65).astype(np.uint8)
         self.view = region
@@ -1130,10 +1259,20 @@ class TriggerCalibDialog(tk.Toplevel):
     def _to_img(self, cx, cy):
         return int(self.view[0] + cx / self.scale), int(self.view[1] + cy / self.scale)
 
+    def _edits(self):
+        x, y, w, h = self.box
+        if self.fix.edits is None or self.fix.edits.shape != (h, w):
+            e = None
+            if self.edits_key and self._old_box == list(self.box):     # same area as last time: keep its fixes
+                e = core.load_edits(self.edits_key, (h, w))
+            self.fix.edits = e.copy() if e is not None else np.zeros((h, w), np.uint8)
+        return self.fix.edits
+
     def _sel(self):
         x, y, w, h = self.box
-        return core.liquid_selection(self.img[y:y + h, x:x + w], [(px - x, py - y) for px, py in self.points],
-                                     self.sim, self.mode_var.get())
+        return core.apply_edits(
+            core.liquid_selection(self.img[y:y + h, x:x + w], [(px - x, py - y) for px, py in self.points],
+                                  self.sim, self.mode_var.get()), self._edits())
 
     def _render(self):
         set_button(self.back, enabled=self.step == "pick")
@@ -1155,7 +1294,7 @@ class TriggerCalibDialog(tk.Toplevel):
             self.sim_lbl.config(text=str(self.sim))
             self.step_lbl.config(text=f"Step 2 of 2  ·  {self.t['name']}")
             m = self._sel()
-            self._show(tuple(self.box), overlay=m)
+            self._show(tuple(self.box), overlay=m, removed=self.fix.edits)
             for px, py in self.points:
                 cx, cy = (px - self.view[0]) * self.scale, (py - self.view[1]) * self.scale
                 self.canvas.create_oval(cx - 5, cy - 5, cx + 5, cy + 5, outline=YELLOW, width=2)
@@ -1176,14 +1315,28 @@ class TriggerCalibDialog(tk.Toplevel):
 
     def _down(self, e):
         if self.step == "pick":
-            self.points.append(self._to_img(e.x, e.y))
-            self._render()
-            return
+            tool = self.fix.tool.get()
+            if tool == "pick":
+                self.points.append(self._to_img(e.x, e.y))
+                self._render()
+                return
+            if tool in ("add", "remove"):
+                self._paint(e)
+                return
         self._drag0 = (e.x, e.y)
         self.canvas.delete("sel")
         self._rect = self.canvas.create_rectangle(e.x, e.y, e.x, e.y, outline=YELLOW, width=2, tags="sel")
 
+    def _paint(self, e):
+        ix, iy = self._to_img(e.x, e.y)
+        self._edits()
+        self.fix.brush(ix - self.box[0], iy - self.box[1])
+        self._render()
+
     def _drag(self, e):
+        if self.step == "pick" and self.fix.tool.get() in ("add", "remove"):
+            self._paint(e)
+            return
         if self._drag0:
             self.canvas.coords(self._rect, *self._drag0, e.x, e.y)
 
@@ -1194,9 +1347,15 @@ class TriggerCalibDialog(tk.Toplevel):
         self._drag0 = None
         a, b = self._to_img(min(x0, e.x), min(y0, e.y))
         c, d = self._to_img(max(x0, e.x), max(y0, e.y))
+        if self.step == "pick":                      # Box in / Box out
+            self._edits()
+            self.fix.rect(a - self.box[0], b - self.box[1], c - self.box[0], d - self.box[1])
+            self._render()
+            return
         if c - a >= 4 and d - b >= 4:
             self.box = [a, b, c - a, d - b]
             self.points = []
+            self.fix.edits = None
             set_button(self.next_btn, enabled=True)
 
     def _undo(self):
@@ -1217,7 +1376,8 @@ class TriggerCalibDialog(tk.Toplevel):
             return
         if float(self._sel().mean()) < 0.005:
             return
-        self.result = {"box": self.box, "points": self.points, "similarity": self.sim, "mode": self.mode_var.get()}
+        self.result = {"box": self.box, "points": self.points, "similarity": self.sim, "mode": self.mode_var.get(),
+                       "edits": self.fix.result()}
         self.destroy()
 
 
@@ -2112,13 +2272,14 @@ class App(tk.Tk):
             return
         pseudo = {"name": f"Flask {slot} globe", "box": g.get("box"), "similarity": g.get("similarity", core.DEFAULT_SIMILARITY),
                   "pick_mode": g.get("pick_mode", "shape")}
-        dlg = TriggerCalibDialog(self, img, pseudo)
+        dlg = TriggerCalibDialog(self, img, pseudo, edits_key=f"globe{slot}")
         self.wait_window(dlg)
         if not dlg.result:
             return
         x, y, w, h = dlg.result["box"]
         core.DATA_DIR.mkdir(parents=True, exist_ok=True)
         cv2.imwrite(str(core.globe_ref_path(slot)), img[y:y + h, x:x + w])
+        core.save_edits(f"globe{slot}", dlg.result.get("edits"))
         g.update(box=dlg.result["box"], liquid_points=[[px - x, py - y] for px, py in dlg.result["points"]],
                  similarity=dlg.result["similarity"], pick_mode=dlg.result["mode"])
         g.setdefault("below", core.GLOBE_BELOW)
@@ -2137,6 +2298,7 @@ class App(tk.Tk):
             core.globe_ref_path(slot).unlink()
         except OSError:
             pass
+        core.save_edits(f"globe{slot}", None)
         core.save_config(self.cfg)
         self.write_log(f"Flask {slot} is no longer linked to a globe." + self._apply_live())
 
@@ -2293,13 +2455,14 @@ class App(tk.Tk):
         img = self._capture()
         if img is None:
             return
-        dlg = TriggerCalibDialog(self, img, t)
+        dlg = TriggerCalibDialog(self, img, t, edits_key=f"trigger{tid}")
         self.wait_window(dlg)
         if not dlg.result:
             return
         x, y, w, h = dlg.result["box"]
         core.DATA_DIR.mkdir(parents=True, exist_ok=True)
         cv2.imwrite(str(core.trigger_ref_path(tid)), img[y:y + h, x:x + w])
+        core.save_edits(f"trigger{tid}", dlg.result.get("edits"))
         t = dict(t, box=dlg.result["box"], liquid_points=[[px - x, py - y] for px, py in dlg.result["points"]],
                  similarity=dlg.result["similarity"], pick_mode=dlg.result["mode"])
         self._save_trigger(t)

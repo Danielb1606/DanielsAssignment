@@ -57,7 +57,7 @@ RECENT_ERRORS: "collections.deque[str]" = collections.deque(maxlen=20)   # for "
 def note_error(where: str) -> None:
     """Remember the current exception (with its full traceback) for diagnostics."""
     RECENT_ERRORS.append(f"[{time.strftime('%H:%M:%S')}] {where}\n{traceback.format_exc()}")
-__version__ = "1.7.3"
+__version__ = "1.8.0"
 # Saved next to the .exe when packaged (a one-file .exe unpacks itself to a
 # temporary folder, so __file__ would point somewhere that gets deleted).
 _BASE = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
@@ -286,6 +286,44 @@ def trigger_ref_path(tid: int) -> Path:
 
 def globe_ref_path(slot: int) -> Path:
     return DATA_DIR / f"globe{slot}_reference.png"
+
+
+# ---------------------------------------------------------------- hand fixes to a selection
+# Optional per area: pixels you painted in (1) or out (2) on top of the colour pick.
+EDIT_ADD, EDIT_REMOVE = 1, 2
+
+
+def edits_path(key: str) -> Path:
+    """key: 'slot3', 'trigger2', 'globe1'."""
+    return DATA_DIR / f"{key}_edits.png"
+
+
+def load_edits(key: str, shape: Tuple[int, int]) -> Optional[np.ndarray]:
+    p = edits_path(key)
+    if not p.exists():
+        return None
+    e = cv2.imread(str(p), cv2.IMREAD_GRAYSCALE)
+    if e is None or e.shape[:2] != tuple(shape[:2]):
+        return None                       # the area changed size: old fixes don't apply
+    return e
+
+
+def save_edits(key: str, edits: Optional[np.ndarray]) -> None:
+    p = edits_path(key)
+    if edits is None or not edits.any():
+        try:
+            p.unlink()
+        except OSError:
+            pass
+        return
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(p), edits.astype(np.uint8))
+
+
+def apply_edits(mask: np.ndarray, edits: Optional[np.ndarray]) -> np.ndarray:
+    if edits is None or edits.shape != mask.shape:
+        return mask
+    return (mask | (edits == EDIT_ADD)) & ~(edits == EDIT_REMOVE)
 
 
 def controller_options(cfg: dict) -> dict:
@@ -617,7 +655,8 @@ class SlotModel:
     that picture, so any flask art and any colour shading works."""
 
     def __init__(self, ref_bgr: np.ndarray, liquid_points: Optional[List[Tuple[int, int]]] = None,
-                 similarity: float = DEFAULT_SIMILARITY, mode: str = "shape"):
+                 similarity: float = DEFAULT_SIMILARITY, mode: str = "shape",
+                 edits: Optional[np.ndarray] = None):
         self.ref = ref_bgr
         self.h, self.w = ref_bgr.shape[:2]
         self.problems: List[str] = []
@@ -625,7 +664,7 @@ class SlotModel:
         pts = [(int(x), int(y)) for x, y in (liquid_points or []) if 0 <= x < self.w and 0 <= y < self.h]
         ref_hsv = cv2.cvtColor(ref_bgr, cv2.COLOR_BGR2HSV)
         self.seeds = [_seed(ref_hsv, x, y) for x, y in pts]
-        self.mask = liquid_selection(ref_bgr, pts, similarity, mode)
+        self.mask = apply_edits(liquid_selection(ref_bgr, pts, similarity, mode), edits)
         if not self.mask.any():
             self.problems.append("no liquid found where you clicked - click on the liquid itself")
 
@@ -748,13 +787,14 @@ def slot_points(s: dict) -> List[Tuple[int, int]]:
 class TriggerModel:
     """How much of the calibrated colour is still showing in a trigger's box (0-100%)."""
 
-    def __init__(self, ref_bgr: np.ndarray, points, similarity: float, mode: str):
+    def __init__(self, ref_bgr: np.ndarray, points, similarity: float, mode: str,
+                 edits: Optional[np.ndarray] = None):
         self.h, self.w = ref_bgr.shape[:2]
         pts = [(int(x), int(y)) for x, y in points if 0 <= x < self.w and 0 <= y < self.h]
         hsv = cv2.cvtColor(ref_bgr, cv2.COLOR_BGR2HSV)
         self.seeds = [_seed(hsv, x, y) for x, y in pts]
         self.similarity = similarity
-        self.mask = liquid_selection(ref_bgr, pts, similarity, mode)
+        self.mask = apply_edits(liquid_selection(ref_bgr, pts, similarity, mode), edits)
 
     def coverage(self, crop_bgr: np.ndarray) -> Optional[float]:
         if not self.mask.any():
@@ -771,12 +811,14 @@ def trigger_model(t: dict) -> Optional[TriggerModel]:
         return None
     ref = cv2.imread(str(p))
     return TriggerModel(ref, [tuple(q) for q in t.get("liquid_points", [])],
-                        t.get("similarity", DEFAULT_SIMILARITY), t.get("pick_mode", "shape"))
+                        t.get("similarity", DEFAULT_SIMILARITY), t.get("pick_mode", "shape"),
+                        load_edits(f"trigger{t['id']}", ref.shape))
 
 
 def model_for(s: dict) -> SlotModel:
-    return SlotModel(cv2.imread(str(ref_path(s["slot"]))), slot_points(s),
-                     s.get("similarity", DEFAULT_SIMILARITY), s.get("pick_mode", "shape"))
+    ref = cv2.imread(str(ref_path(s["slot"])))
+    return SlotModel(ref, slot_points(s), s.get("similarity", DEFAULT_SIMILARITY), s.get("pick_mode", "shape"),
+                     load_edits(f"slot{s['slot']}", ref.shape) if ref is not None else None)
 
 
 # ================================================================ auto-detection
@@ -929,9 +971,11 @@ class FlaskReader:
         for s in cfg["slots"]:
             g = s.get("globe")
             if g and g.get("box") and globe_ref_path(s["slot"]).exists():
+                gref = cv2.imread(str(globe_ref_path(s["slot"])))
                 self.globe_models[s["slot"]] = TriggerModel(
-                    cv2.imread(str(globe_ref_path(s["slot"]))), [tuple(q) for q in g.get("liquid_points", [])],
-                    g.get("similarity", DEFAULT_SIMILARITY), g.get("pick_mode", "shape"))
+                    gref, [tuple(q) for q in g.get("liquid_points", [])],
+                    g.get("similarity", DEFAULT_SIMILARITY), g.get("pick_mode", "shape"),
+                    load_edits(f"globe{s['slot']}", gref.shape))
                 self.globe_boxes[s["slot"]] = g["box"]
         self.trigger_values: Dict[int, Optional[float]] = {}
         self.trigger_crops: Dict[int, np.ndarray] = {}
@@ -1695,6 +1739,7 @@ def calibrate_from_image(img: np.ndarray, cfg: dict, boxes: Dict[int, List[int]]
         sc["similarity"] = int(ls.get("similarity", DEFAULT_SIMILARITY))
         sc["pick_mode"] = ls.get("mode", "shape") if ls.get("mode") in PICK_MODES else "shape"
         cv2.imwrite(str(ref_path(slot)), _crop(img, box))
+        save_edits(f"slot{slot}", ls.get("edits"))        # hand fixes (none = cleared)
     save_config(cfg)
     return report(img, cfg, boxes.keys())
 

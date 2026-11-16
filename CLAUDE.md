@@ -33,6 +33,12 @@ It lives in Dan's Workshop at `apps\Daniels Assignment\` (data in `daniels_assig
 - Self-update: rename-swap of the running exe with handshake + rollback (updater.py).
 - Report a problem button zips logs/config for Claude.
 
+- Colour picking: a click seeds only from nearby pixels that match the clicked one (`_seed`); a magnifier
+  (`Loupe`) shows the exact pixel. Optional hand fixes (`HandFix`): Paint in/out (brush 1-3 px, click and hold)
+  and Box in/out, stored per area as `<key>_edits.png` (0 none, 1 add, 2 remove; key slotN / triggerN / globeN),
+  applied on top of the colour pick by `apply_edits`, ignored if the area's size changes. Painted-out pixels show
+  dark red. FULL = top 15% of the (fixed) liquid area still >= 60% matching, so decorations must be kept out of it.
+
 ## Working with Dan
 - Before bigger changes, show suggestions/examples to pick between. Small fixes: just do them, mention after.
 - Speed: push and reply without waiting for the build; screenshots only for new screens.

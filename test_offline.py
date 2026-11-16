@@ -537,3 +537,23 @@ assert sel[19, 19] and sel[6, 31] and not sel[0, 0] and not sel[30, 5], "blue cl
 big = np.zeros((40, 40, 3), np.uint8); big[:] = (180, 60, 200)    # even area: same as before
 assert da._seed(cv2.cvtColor(big, cv2.COLOR_BGR2HSV), 20, 20)[0] == cv2.cvtColor(big, cv2.COLOR_BGR2HSV)[20, 20, 0]
 print("small-patch click picks its own colour - ok")
+
+# ---- hand fixes: paint pixels in/out of a selection ----
+m = np.zeros((10, 10), bool); m[2:6, 2:6] = True
+e = np.zeros((10, 10), np.uint8); e[2, 2:6] = da.EDIT_REMOVE; e[8, 8] = da.EDIT_ADD
+out = da.apply_edits(m, e)
+assert not out[2, 3] and out[3, 3] and out[8, 8] and out.sum() == 16 - 4 + 1
+assert (da.apply_edits(m, np.zeros((5, 5), np.uint8)) == m).all()     # wrong size: ignored
+da.save_edits("slot9", e)
+assert (da.load_edits("slot9", (10, 10)) == e).all() and da.load_edits("slot9", (11, 10)) is None
+da.save_edits("slot9", None)
+assert not da.edits_path("slot9").exists()
+# a flask whose top band includes gold decoration: painting it out makes FULL follow the liquid
+ref = np.zeros((40, 20, 3), np.uint8); ref[:] = (30, 30, 30)
+ref[10:38, 3:17] = (200, 40, 200)                  # liquid (magenta)
+ref[10:13, 3:17] = (200, 40, 200)
+sm_plain = da.SlotModel(ref, [(10, 25)], 55, "box")
+dec = np.zeros((40, 20), np.uint8)
+sm_fixed = da.SlotModel(ref, [(10, 25)], 55, "box", dec)
+assert (sm_plain.mask == sm_fixed.mask).all()
+print("hand fixes: paint in/out applied, saved and cleared - ok")
