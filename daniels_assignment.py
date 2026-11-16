@@ -57,7 +57,7 @@ RECENT_ERRORS: "collections.deque[str]" = collections.deque(maxlen=20)   # for "
 def note_error(where: str) -> None:
     """Remember the current exception (with its full traceback) for diagnostics."""
     RECENT_ERRORS.append(f"[{time.strftime('%H:%M:%S')}] {where}\n{traceback.format_exc()}")
-__version__ = "1.7.1"
+__version__ = "1.7.2"
 # Saved next to the .exe when packaged (a one-file .exe unpacks itself to a
 # temporary folder, so __file__ would point somewhere that gets deleted).
 _BASE = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
@@ -519,8 +519,17 @@ PICK_MODES = ("shape", "box")
 
 
 def _seed(hsv: np.ndarray, x: int, y: int) -> Tuple[int, float, float]:
-    """Liquid colour around a clicked spot: (hue, saturation, brightness)."""
+    """Liquid colour around a clicked spot: (hue, saturation, brightness).
+    Averages only the nearby pixels that look like the one actually clicked, so a
+    click on a tiny patch (e.g. dark blue between gold) isn't swamped by its surroundings."""
     patch = hsv[max(0, y - 2):y + 3, max(0, x - 2):x + 3].reshape(-1, 3).astype(float)
+    hc, sc, vc = (float(v) for v in hsv[y, x])
+    if sc >= SAT_FLOOR * 0.5:                   # a real colour was clicked (not grey glass)
+        d = np.abs(patch[:, 0] - hc)
+        d = np.minimum(d, 180 - d)
+        like = (d <= 12) & (np.abs(patch[:, 1] - sc) <= 80) & (np.abs(patch[:, 2] - vc) <= 80)
+        if like.any():
+            patch = patch[like]
     ang = patch[:, 0] * (2 * np.pi / 180)
     hue = int(round((np.arctan2(np.sin(ang).mean(), np.cos(ang).mean()) % (2 * np.pi)) * 180 / (2 * np.pi))) % 180
     return hue, float(np.median(patch[:, 1])), float(np.median(patch[:, 2]))

@@ -526,3 +526,14 @@ n = len(rs3.presses)
 rc3.run(2)
 assert rc3.utility == (3,) and 3 in rs3.presses[n:], rs3.presses
 print("live role change: flask 3 used as utility without restarting - ok")
+
+# ---- clicking a tiny dark-blue patch between gold picks blue, not gold ----
+img = np.zeros((40, 40, 3), np.uint8)
+img[:] = (40, 170, 210)                 # gold (BGR)
+img[18:22, 18:22] = (120, 40, 20)       # small dark blue patch
+img[5:9, 30:34] = (130, 50, 25)         # another blue bit elsewhere
+sel = da.liquid_selection(img, [(19, 19)], 55, "box")
+assert sel[19, 19] and sel[6, 31] and not sel[0, 0] and not sel[30, 5], "blue click should select blue only"
+big = np.zeros((40, 40, 3), np.uint8); big[:] = (180, 60, 200)    # even area: same as before
+assert da._seed(cv2.cvtColor(big, cv2.COLOR_BGR2HSV), 20, 20)[0] == cv2.cvtColor(big, cv2.COLOR_BGR2HSV)[20, 20, 0]
+print("small-patch click picks its own colour - ok")
