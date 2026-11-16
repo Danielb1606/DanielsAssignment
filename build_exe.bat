@@ -5,7 +5,7 @@ echo Installing build tools...
 python -m pip install --upgrade pip >nul
 python -m pip install -r requirements.txt pyinstaller || goto :fail
 echo Building...
-python -m PyInstaller --onefile --windowed --name DanielsAssignment ^
+python -m PyInstaller --onefile --windowed --name DanielsAssignment --icon assets/icon.ico --add-data "assets;assets" ^
   --collect-submodules pynput --hidden-import pynput.keyboard._win32 --hidden-import pynput.mouse._win32 ^
   daniels_assignment.py || goto :fail
 echo.

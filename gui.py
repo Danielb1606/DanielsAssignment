@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import queue
+import sys
+from pathlib import Path
 import threading
 import time
 import tkinter as tk
@@ -2695,6 +2697,20 @@ def _clean_notes(notes: str) -> str:
     return "\n".join(keep[:12])
 
 
+def _set_icon(root) -> None:
+    """Red flask icon for the title bar and taskbar (every size, so it's sharp)."""
+    base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)) / "assets"
+    try:
+        root.iconbitmap(default=str(base / "icon.ico"))
+    except tk.TclError:
+        pass
+    try:
+        root._icons = [tk.PhotoImage(file=str(base / n)) for n in ("icon.png", "icon48.png", "icon32.png", "icon16.png")]
+        root.iconphoto(True, *root._icons)
+    except tk.TclError:
+        pass
+
+
 def launch():
     _dpi_aware()
     updated = None
@@ -2704,6 +2720,7 @@ def launch():
         except Exception:
             updated = None
     app = App(updated)
+    _set_icon(app)
     app.update_idletasks()
     w = min(app.winfo_reqwidth(), app.winfo_screenwidth() - 40)
     h = min(app.winfo_reqheight(), app.winfo_screenheight() - 80)
