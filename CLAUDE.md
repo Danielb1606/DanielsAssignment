@@ -39,6 +39,11 @@ It lives in Dan's Workshop at `apps\Daniels Assignment\` (data in `daniels_assig
   applied on top of the colour pick by `apply_edits`, ignored if the area's size changes. Painted-out pixels show
   dark red. FULL = top 15% of the (fixed) liquid area still >= 60% matching, so decorations must be kept out of it.
 
+## Icons
+- Red flask (Dan's pick). Taskbar sizes (<=48 px) are the flask alone with a thin dark outline, no dark tile,
+  so it fills the taskbar slot; larger sizes keep the tile. Dan's rule: the taskbar icon must match the app's
+  picture in Dan's Workshop (assets/app_daniels-assignment.png there).
+
 ## Working with Dan
 - Before bigger changes, show suggestions/examples to pick between. Small fixes: just do them, mention after.
 - Speed: push and reply without waiting for the build; screenshots only for new screens.
