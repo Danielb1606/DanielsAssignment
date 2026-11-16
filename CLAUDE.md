@@ -15,6 +15,12 @@ It lives in Dan's Workshop at `apps\Daniels Assignment\` (data in `daniels_assig
   shows under `refresh_below`% left, default 10, judged against the longest the strip has been), Not used.
   Stored as `kind` / `refresh_below` per slot in config.json. Dan's current belt: 1 life, 2 mana,
   3 utility, 4-5 quicksilver. Town mode only counts quicksilver failures.
+- Per flask (name menu → Settings for flask N…): own press delay range (`delay_min_ms`/`delay_max_ms`,
+  else the main 150-300 ms), and an optional globe link (`globe`: box + colour like a trigger, `below` %
+  chosen by Dan, `again_ms` repeat while still low, ref image `globeN_reference.png`). A linked flask is
+  pressed when its normal rule says so OR the globe is below `below`% (Dan's choice: full OR globe low).
+- Every check takes ONE screenshot of the rectangle covering all areas (flasks, strips, triggers, globes),
+  4 checks/s by default; presses fire at their exact scheduled time between checks.
 - 4 checks/s; random 150-300 ms delay before a press (professor's requirement); key hold random 20-90 ms;
   keys sent as hardware scan codes (SendInput), pynput fallback.
 - Calibration GUI: draw boxes, click the liquid colour, Similarity slider (default 55), shape/box modes,

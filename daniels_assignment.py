@@ -57,7 +57,7 @@ RECENT_ERRORS: "collections.deque[str]" = collections.deque(maxlen=20)   # for "
 def note_error(where: str) -> None:
     """Remember the current exception (with its full traceback) for diagnostics."""
     RECENT_ERRORS.append(f"[{time.strftime('%H:%M:%S')}] {where}\n{traceback.format_exc()}")
-__version__ = "1.6.0"
+__version__ = "1.7.0"
 # Saved next to the .exe when packaged (a one-file .exe unpacks itself to a
 # temporary folder, so __file__ would point somewhere that gets deleted).
 _BASE = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
@@ -201,6 +201,25 @@ BAR_KINDS = ("quicksilver", "utility")      # flasks with a timer strip under th
 UTILITY_REFRESH_BELOW = 10    # % of the effect left before a utility flask is used again
 
 
+GLOBE_BELOW = 50          # % of the globe's colour left before the flask is pressed
+GLOBE_AGAIN_MS = 2000     # while the globe stays low, press again after this long
+
+
+def slot_options(cfg: Optional[dict]) -> Dict[int, dict]:
+    """Per-flask extras: own delay range and the globe link."""
+    out = {}
+    for sc in (cfg or {}).get("slots", []):
+        o = {}
+        if sc.get("delay_min_ms") is not None and sc.get("delay_max_ms") is not None:
+            o["delay"] = (sc["delay_min_ms"] / 1000.0, sc["delay_max_ms"] / 1000.0)
+        g = sc.get("globe")
+        if g and g.get("box"):
+            o["globe_below"] = float(g.get("below", GLOBE_BELOW))
+            o["globe_again"] = float(g.get("again_ms", GLOBE_AGAIN_MS)) / 1000.0
+        out[int(sc["slot"])] = o
+    return out
+
+
 def slot_refresh(cfg: Optional[dict]) -> Dict[int, float]:
     return {int(sc["slot"]): float(sc.get("refresh_below", UTILITY_REFRESH_BELOW))
             for sc in (cfg or {}).get("slots", [])}
@@ -263,6 +282,15 @@ def new_trigger(cfg: dict) -> dict:
 
 def trigger_ref_path(tid: int) -> Path:
     return DATA_DIR / f"trigger{tid}_reference.png"
+
+
+def globe_ref_path(slot: int) -> Path:
+    return DATA_DIR / f"globe{slot}_reference.png"
+
+
+def controller_options(cfg: dict) -> dict:
+    """Per-flask choices from the config, for FlaskController(**options)."""
+    return {"kinds": slot_kinds(cfg), "refresh_below": slot_refresh(cfg), "slot_opts": slot_options(cfg)}
 
 
 def validate_trigger(t: dict) -> List[str]:
@@ -481,6 +509,7 @@ class SlotReading:
     sig: Optional[np.ndarray] = None   # small picture of the liquid area, to spot any change
     brightness: float = 1.0            # frame brightness vs. the calibration picture (pause = dimmer)
     remaining: float = 0.0             # share of the timer strip still showing (0 = not running, 1 = just used)
+    globe: Optional[float] = None      # % of the linked globe's colour showing (None = no globe linked)
 
 
 DEFAULT_SIMILARITY = 55   # calibration slider default (1-100)
@@ -886,10 +915,19 @@ class FlaskReader:
             if m is not None:
                 self.trigger_models[t["id"]] = m
         self.trigger_boxes = {t["id"]: t["box"] for t in cfg.get("triggers", []) if t["id"] in self.trigger_models}
+        self.globe_models: Dict[int, TriggerModel] = {}
+        self.globe_boxes: Dict[int, List[int]] = {}
+        for s in cfg["slots"]:
+            g = s.get("globe")
+            if g and g.get("box") and globe_ref_path(s["slot"]).exists():
+                self.globe_models[s["slot"]] = TriggerModel(
+                    cv2.imread(str(globe_ref_path(s["slot"]))), [tuple(q) for q in g.get("liquid_points", [])],
+                    g.get("similarity", DEFAULT_SIMILARITY), g.get("pick_mode", "shape"))
+                self.globe_boxes[s["slot"]] = g["box"]
         self.trigger_values: Dict[int, Optional[float]] = {}
         self.trigger_crops: Dict[int, np.ndarray] = {}
         boxes = [s["box"] for s in cfg["slots"]] + [s["bar_box"] for s in cfg["slots"] if s["bar_box"]] + \
-            list(self.trigger_boxes.values())
+            list(self.trigger_boxes.values()) + list(self.globe_boxes.values())
         self.bx0 = min(b[0] for b in boxes)
         self.by0 = min(b[1] for b in boxes)
         self.bx1 = max(b[0] + b[2] for b in boxes)
@@ -940,6 +978,10 @@ class FlaskReader:
                 bar = region[by - self.by0:by - self.by0 + bh, bx - self.bx0:bx - self.bx0 + bw]
             self.last_crops[s["slot"]] = (crop, bar)
             out[s["slot"]] = self.models[s["slot"]].read(crop, bar, self.bar_bgr)
+            if s["slot"] in self.globe_boxes:
+                gx, gy, gw, gh = self.globe_boxes[s["slot"]]
+                gcrop = region[gy - self.by0:gy - self.by0 + gh, gx - self.bx0:gx - self.bx0 + gw]
+                out[s["slot"]].globe = self.globe_models[s["slot"]].coverage(gcrop)
         vals = {}
         for tid, (x, y, w, h) in self.trigger_boxes.items():
             crop = region[y - self.by0:y - self.by0 + h, x - self.bx0:x - self.bx0 + w]
@@ -968,13 +1010,16 @@ class FlaskController:
                  read_triggers: Callable[[], Dict[int, Optional[float]]] = lambda: {},
                  press_key: Optional[Callable[[str], bool]] = None,
                  kinds: Optional[Dict[int, str]] = None,
-                 refresh_below: Optional[Dict[int, float]] = None):
+                 refresh_below: Optional[Dict[int, float]] = None,
+                 slot_opts: Optional[Dict[int, dict]] = None):
         self.read, self.press = read, press
         self.kinds = dict(kinds or SLOT_KINDS)
         self.quick = tuple(sorted(sl for sl, k in self.kinds.items() if k == "quicksilver"))
         self.instill = tuple(sorted(sl for sl, k in self.kinds.items() if k in ("life", "mana")))
         self.utility = tuple(sorted(sl for sl, k in self.kinds.items() if k == "utility"))
         self.refresh_below: Dict[int, float] = dict(refresh_below or {})
+        self.slot_opts: Dict[int, dict] = dict(slot_opts or {})
+        self.last_globe_press: Dict[int, float] = {}
         self.triggers = [t for t in (triggers or []) if t.get("enabled", True)]
         self.read_triggers = read_triggers
         self.press_key = press_key or (lambda combo: False)
@@ -1128,7 +1173,8 @@ class FlaskController:
                     self._schedule(slot, now)
                     break
         for slot in self.instill:
-            if r[slot].visible and r[slot].full and self._can_schedule(slot, now):
+            rd = r[slot]
+            if rd.visible and rd.full and self._can_schedule(slot, now):
                 self._schedule(slot, now)
         # utility flasks: keep each one's effect going on its own (no taking turns)
         for slot in self.utility:
@@ -1137,6 +1183,17 @@ class FlaskController:
             if (rd.visible and rd.full and low and self._can_schedule(slot, now)
                     and now - self.last_press.get(slot, -1e9) >= ACTIVATION_GRACE + 1.0):
                 self._schedule(slot, now)
+        # globe link: also press a flask whenever its globe drops below the chosen %
+        for slot, o in self.slot_opts.items():
+            if "globe_below" not in o or self.kinds.get(slot) == "off" or slot not in r:
+                continue
+            rd = r[slot]
+            if (rd.visible and rd.globe is not None and rd.globe < o["globe_below"]
+                    and slot not in self.queued and slot not in self.verify
+                    and now - self.last_press.get(slot, -1e9) >= self.cooldown
+                    and now - self.last_globe_press.get(slot, -1e9) >= o["globe_again"]):
+                self.last_globe_press[slot] = now
+                self._schedule(slot, now, f"globe at {rd.globe:.0f}% (below {o['globe_below']:g}%)")
 
     def _run_triggers(self, now: float) -> None:
         values = self.read_triggers() or {}
@@ -1182,11 +1239,11 @@ class FlaskController:
             return False
         return now - self.last_press.get(slot, -1e9) >= self.cooldown
 
-    def _schedule(self, slot: int, now: float) -> None:
-        delay = self.rng.uniform(*self.delay_range)
+    def _schedule(self, slot: int, now: float, why: str = "full") -> None:
+        delay = self.rng.uniform(*self.slot_opts.get(slot, {}).get("delay", self.delay_range))
         heapq.heappush(self.queue, _Pending(now + delay, slot))
         self.queued.add(slot)
-        self.log(f"[{now:8.3f}] slot {slot} full -> press in {delay * 1000:.0f} ms")
+        self.log(f"[{now:8.3f}] slot {slot} {why} -> press in {delay * 1000:.0f} ms")
 
     def _fire_due(self) -> None:
         now = self.clock()
@@ -1806,8 +1863,7 @@ def cmd_run(args) -> None:
         raise SystemExit("Set your program's window title first:  calibrate --window \"<title>\"")
     locator = WindowLocator(cfg["window_title"], cfg.get("screen_origin", (0, 0)))
     reader = FlaskReader(cfg, locator, ScreenGrabber())
-    ctl = FlaskController(reader.read, KeySender(cfg, locator), settings=get_settings(cfg), kinds=slot_kinds(cfg),
-                        refresh_below=slot_refresh(cfg))
+    ctl = FlaskController(reader.read, KeySender(cfg, locator), settings=get_settings(cfg), **controller_options(cfg))
 
     from pynput import keyboard
 

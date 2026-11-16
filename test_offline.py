@@ -477,3 +477,41 @@ rc2 = da.FlaskController(rs2.read, rs2.press, clock=rs2.now, sleep=rs2.sleep, rn
 rc2.run(4)
 assert 3 not in rs2.presses, rs2.presses        # off: never pressed
 print("roles: utility waits for <10% left, quicksilvers 4/5 only, 'not used' never pressed - ok")
+
+# ---- globe link + per-flask delay ----
+print("\n=== Globe link and per-flask delay ===")
+class GlobeSim:
+    def __init__(s):
+        s.t = 0.0; s.presses = []; s.globe = 80.0
+    def now(s): return s.t
+    def sleep(s, d): s.t += d
+    def read(s):
+        out = {}
+        for k in range(1, 6):
+            rd = da.SlotReading(True, k != 1, k >= 4, 0.5, 1.0, None, 1.0)   # flask 1 NOT full
+            if k == 1: rd.globe = s.globe
+            out[k] = rd
+        return out
+    def press(s, k):
+        s.presses.append((round(s.t, 3), k)); return True
+gs = GlobeSim(); glog = []
+cfg = da.default_config()
+sc1 = da.slot_cfg(cfg, 1)
+sc1["globe"] = {"box": [0, 0, 10, 10], "below": 40, "again_ms": 2000}
+sc1["delay_min_ms"], sc1["delay_max_ms"] = 400, 450
+opts = da.slot_options(cfg)
+assert opts[1]["globe_below"] == 40 and opts[1]["delay"] == (0.4, 0.45), opts[1]
+gc = da.FlaskController(gs.read, gs.press, clock=gs.now, sleep=gs.sleep, rng=random.Random(5), log=glog.append,
+                        kinds=da.slot_kinds(cfg), slot_opts=opts)
+gc.run(2)
+assert not any(k == 1 for _, k in gs.presses), gs.presses          # globe 80% > 40%: flask 1 (not full) left alone
+gs.globe = 30.0
+t0 = gs.t
+gc.run(5)
+p1 = [t for t, k in gs.presses if k == 1]
+assert p1, "flask 1 should be pressed when the globe is low"
+assert 0.4 <= p1[0] - t0 <= 0.45 + 0.3, (p1, t0)                   # its own 400-450 ms delay (+ one check)
+assert all(b - a >= 2.0 - 0.06 for a, b in zip(p1, p1[1:])), p1    # again only every 2 s (± the random delay) while still low
+d = [float(l.split("in ")[1].split(" ms")[0]) for l in glog if "slot 1 globe" in l]
+assert d and all(400 <= x <= 450 for x in d), d
+print(f"globe: flask 1 pressed at {p1} (globe 30% < 40%), delays {d} - ok")

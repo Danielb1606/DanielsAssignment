@@ -190,7 +190,7 @@ class Engine:
                 lambda: self._read_and_store(reader), sender, log=self.log, settings=settings,
                 triggers=[t for t in cfg.get("triggers", []) if t["id"] in reader.trigger_models],
                 read_triggers=lambda: reader.trigger_values, press_key=sender.press_combo,
-                kinds=core.slot_kinds(cfg), refresh_below=core.slot_refresh(cfg))
+                **core.controller_options(cfg))
             self.controller.on_town = lambda on: self.log_q.put("__TOWN_ON__" if on else "__TOWN_OFF__")
             target = self._run_loop
             args = ()
@@ -301,6 +301,113 @@ class FlaskCard(tk.Frame):
                 self.run_pill.config(text=txt, bg=YELLOW, fg="#1a140c", highlightbackground=YELLOW)
             else:
                 self.run_pill.config(text="not running", bg=PANEL, fg=MUTED, highlightbackground=GREY)
+
+
+# ================================================================ per-flask settings
+class FlaskSettingsDialog(tk.Toplevel):
+    """Own delay range, globe threshold and (utility) refresh % for one flask."""
+
+    def __init__(self, parent, cfg: dict, slot: int):
+        super().__init__(parent, bg=BG)
+        self.cfg, self.slot = cfg, slot
+        self.sc = core.slot_cfg(cfg, slot)
+        self.saved = ""
+        self.title(f"{core.APP} | Flask {slot}")
+        self.transient(parent)
+        self.resizable(False, False)
+        st = core.get_settings(cfg)
+        kind = self.sc["kind"]
+        tk.Label(self, text=f"Flask {slot}  ·  {KIND_LABEL.get(kind, kind)}", bg=BG, fg=GOLD, font=TITLE_FONT).pack(
+            anchor="w", padx=20, pady=(16, 8))
+        self.vars = {}
+
+        def section(title, sub):
+            box = tk.Frame(self, bg=PANEL, highlightthickness=1, highlightbackground=BORDER)
+            box.pack(fill="x", padx=20, pady=(0, 10))
+            tk.Label(box, text=title, bg=PANEL, fg=GOLD, font=H_FONT).pack(anchor="w", padx=12, pady=(10, 0))
+            tk.Label(box, text=sub, bg=PANEL, fg=MUTED, font=SMALL, justify="left", wraplength=420).pack(anchor="w", padx=12)
+            inner = tk.Frame(box, bg=PANEL)
+            inner.pack(fill="x", padx=12, pady=(6, 12))
+            return inner
+
+        def field(parent, key, label, value, unit):
+            row = tk.Frame(parent, bg=PANEL)
+            row.pack(anchor="w", pady=2)
+            tk.Label(row, text=label, bg=PANEL, fg=TEXT, font=FONT, width=26, anchor="w").pack(side="left")
+            v = tk.StringVar(value=value)
+            tk.Entry(row, textvariable=v, width=7, bg=PANEL_2, fg=TEXT, insertbackground=TEXT, relief="flat",
+                     font=H_FONT, justify="center", highlightthickness=1, highlightbackground=BORDER,
+                     highlightcolor=GOLD).pack(side="left", ipady=2)
+            tk.Label(row, text=unit, bg=PANEL, fg=MUTED, font=FONT).pack(side="left", padx=6)
+            self.vars[key] = v
+
+        b = section("Delay before pressing", f"A random wait in this range before this flask is pressed. "
+                    f"Leave it at {st['delay_min_ms']}-{st['delay_max_ms']} ms to use the main setting.")
+        field(b, "dmin", "Shortest", self.sc.get("delay_min_ms", st["delay_min_ms"]), "ms")
+        field(b, "dmax", "Longest", self.sc.get("delay_max_ms", st["delay_max_ms"]), "ms")
+        self.global_delay = (st["delay_min_ms"], st["delay_max_ms"])
+
+        g = self.sc.get("globe") or {}
+        if g.get("box"):
+            b = section("Globe", "Pressed whenever the linked globe drops below this much of its colour "
+                        "(as well as its normal rule). The card shows the globe % live in Test mode.")
+            field(b, "below", "Press when the globe is below", g.get("below", core.GLOBE_BELOW), "%")
+            field(b, "again", "If still low, press again after", g.get("again_ms", core.GLOBE_AGAIN_MS) / 1000, "seconds")
+        else:
+            b = section("Globe", "Not linked. Use “Link to a globe…” on the flask's name menu to press "
+                        "this flask when your life or mana globe gets low.")
+
+        if kind == "utility":
+            b = section("Utility", "Used when it's full and less than this much of its effect is left.")
+            field(b, "refresh", "Use again below", self.sc.get("refresh_below", core.UTILITY_REFRESH_BELOW), "% left")
+
+        bar = tk.Frame(self, bg=BG)
+        bar.pack(fill="x", padx=20, pady=(4, 16))
+        self.err = tk.Label(bar, text="", bg=BG, fg=RED, font=SMALL)
+        self.err.pack(side="left")
+        button(bar, "Save", self.save, kind="primary").pack(side="right")
+        button(bar, "Cancel", self.destroy, kind="ghost").pack(side="right", padx=8)
+        self.grab_set()
+
+    def _num(self, key, lo, hi, name):
+        try:
+            v = float(self.vars[key].get().strip())
+        except ValueError:
+            raise ValueError(f"{name}: enter a number")
+        if not lo <= v <= hi:
+            raise ValueError(f"{name} must be {lo:g}-{hi:g}")
+        return v
+
+    def save(self):
+        notes = []
+        try:
+            dmin, dmax = self._num("dmin", 0, 5000, "Shortest delay"), self._num("dmax", 0, 5000, "Longest delay")
+            if dmin > dmax:
+                raise ValueError("Shortest delay can't be more than the longest")
+            below = again = refresh = None
+            if "below" in self.vars:
+                below = self._num("below", 1, 99, "Globe %")
+                again = self._num("again", 0.2, 60, "Press again after")
+            if "refresh" in self.vars:
+                refresh = self._num("refresh", 1, 100, "Use again below")
+        except ValueError as e:
+            self.err.config(text=str(e))
+            return
+        if (int(dmin), int(dmax)) != tuple(int(x) for x in self.global_delay):
+            self.sc["delay_min_ms"], self.sc["delay_max_ms"] = int(dmin), int(dmax)
+            notes.append(f"delay {int(dmin)}-{int(dmax)} ms")
+        else:
+            self.sc.pop("delay_min_ms", None)
+            self.sc.pop("delay_max_ms", None)
+        if below is not None:
+            self.sc["globe"]["below"] = below
+            self.sc["globe"]["again_ms"] = int(again * 1000)
+            notes.append(f"globe below {below:g}%")
+        if refresh is not None:
+            self.sc["refresh_below"] = refresh
+            notes.append(f"used again below {refresh:g}% left")
+        self.saved = f"Flask {self.slot} saved" + (": " + ", ".join(notes) if notes else "") + "."
+        self.destroy()
 
 
 # ================================================================ calibration dialog
@@ -1831,10 +1938,12 @@ class App(tk.Tk):
                 card.set_state("NOT VISIBLE", ORANGE, "belt hidden / covered", run, left)
             elif rd.brightness < core.PAUSE_DIM:
                 card.set_state("PAUSED", GREY, "program looks paused (dimmed)", run, left)
-            elif rd.full:
-                card.set_state("FULL", GREEN, f"about {rd.fill:.0%}", run, left)
             else:
-                card.set_state("NOT FULL", RED, f"about {rd.fill:.0%}", run, left)
+                gtxt = f" · globe {rd.globe:.0f}%" if rd.globe is not None else ""
+                if rd.full:
+                    card.set_state("FULL", GREEN, f"about {rd.fill:.0%}{gtxt}", run, left)
+                else:
+                    card.set_state("NOT FULL", RED, f"about {rd.fill:.0%}{gtxt}", run, left)
 
     # -- actions ------------------------------------------------------------
     def _capture(self) -> Optional[np.ndarray]:
@@ -1919,10 +2028,69 @@ class App(tk.Tk):
         for k, name in core.KIND_NAMES.items():
             mark = "✓ " if sc["kind"] == k else "   "
             m.add_command(label=f"{mark}{name}  ({tips[k]})", command=lambda k=k: self.set_kind(slot, k))
-        if sc["kind"] == "utility":
-            m.add_separator()
-            m.add_command(label="Change the 'use again' % …", command=lambda: self.set_refresh(slot))
+        m.add_separator()
+        g = sc.get("globe") or {}
+        if g.get("box"):
+            m.add_command(label=f"Globe linked: pressed below {g.get('below', core.GLOBE_BELOW):g}%  (change in Settings…)",
+                          state="disabled")
+            m.add_command(label="Pick the globe again…", command=lambda: self.pick_globe(slot))
+            m.add_command(label="Unlink the globe", command=lambda: self.unlink_globe(slot))
+        else:
+            m.add_command(label="Link to a globe (red life / blue mana)…", command=lambda: self.pick_globe(slot))
+        m.add_command(label=f"Settings for flask {slot}…", command=lambda: self.flask_settings(slot))
         m.tk_popup(x, y)
+
+    def pick_globe(self, slot: int):
+        if self.engine.mode != "idle":
+            messagebox.showinfo(core.APP, "Stop first, then link the globe.")
+            return
+        self._save_window()
+        sc = core.slot_cfg(self.cfg, slot)
+        g = dict(sc.get("globe") or {})
+        if not messagebox.askokcancel(core.APP, "Make sure the globe is completely full in your program.\n\n"
+                                      "When you click OK this window hides for a moment and takes a picture. Then draw a "
+                                      "box around the globe and click its colour (red for life, blue for mana)."):
+            return
+        img = self._capture()
+        if img is None:
+            return
+        pseudo = {"name": f"Flask {slot} globe", "box": g.get("box"), "similarity": g.get("similarity", core.DEFAULT_SIMILARITY),
+                  "pick_mode": g.get("pick_mode", "shape")}
+        dlg = TriggerCalibDialog(self, img, pseudo)
+        self.wait_window(dlg)
+        if not dlg.result:
+            return
+        x, y, w, h = dlg.result["box"]
+        core.DATA_DIR.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(core.globe_ref_path(slot)), img[y:y + h, x:x + w])
+        g.update(box=dlg.result["box"], liquid_points=[[px - x, py - y] for px, py in dlg.result["points"]],
+                 similarity=dlg.result["similarity"], pick_mode=dlg.result["mode"])
+        g.setdefault("below", core.GLOBE_BELOW)
+        g.setdefault("again_ms", core.GLOBE_AGAIN_MS)
+        sc["globe"] = g
+        core.save_config(self.cfg)
+        self._build_cards()
+        self.write_log(f"Flask {slot} is linked to the globe: it's pressed when the globe is below {g['below']:g}%. "
+                       f"Change the % in Settings for flask {slot}. Check it in Test mode (the card shows the globe %).")
+        self.flask_settings(slot)
+
+    def unlink_globe(self, slot: int):
+        sc = core.slot_cfg(self.cfg, slot)
+        sc.pop("globe", None)
+        try:
+            core.globe_ref_path(slot).unlink()
+        except OSError:
+            pass
+        core.save_config(self.cfg)
+        self.write_log(f"Flask {slot} is no longer linked to a globe.")
+
+    def flask_settings(self, slot: int):
+        dlg = FlaskSettingsDialog(self, self.cfg, slot)
+        self.wait_window(dlg)
+        if dlg.saved:
+            core.save_config(self.cfg)
+            self._build_cards()
+            self.write_log(dlg.saved + (" Stop and Start again for it to take effect." if self.engine.mode != "idle" else ""))
 
     def set_kind(self, slot: int, kind: str):
         sc = core.slot_cfg(self.cfg, slot)
@@ -1941,18 +2109,6 @@ class App(tk.Tk):
         if self.engine.mode != "idle":
             msg += " Stop and Start again for it to take effect."
         self.write_log(msg)
-
-    def set_refresh(self, slot: int):
-        from tkinter import simpledialog
-        sc = core.slot_cfg(self.cfg, slot)
-        v = simpledialog.askinteger(core.APP, f"Use flask {slot} again when less than this % of its effect is left:",
-                                    initialvalue=int(sc.get("refresh_below", core.UTILITY_REFRESH_BELOW)),
-                                    minvalue=1, maxvalue=100, parent=self)
-        if v:
-            sc["refresh_below"] = v
-            core.save_config(self.cfg)
-            self.write_log(f"Flask {slot} will be used again below {v}% left"
-                           + (" (Stop and Start again for it to take effect)." if self.engine.mode != "idle" else "."))
 
     def toggle_test(self):
         if self.engine.mode == "test":
