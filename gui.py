@@ -744,6 +744,7 @@ class CalibrationDialog(tk.Toplevel):
     def _edits(self, slot):
         """Hand fixes for this flask (sized to its box)."""
         x, y, w, h = self.boxes[slot]
+        h, w = self.img[y:y + h, x:x + w].shape[:2]     # the part of the box that's on the picture
         e = self.edit_store.get(slot)
         if e is None or e.shape != (h, w):
             e = None
@@ -874,6 +875,11 @@ class CalibrationDialog(tk.Toplevel):
         if c - a < 4 or d - b < 4:
             self.canvas.delete("sel")
             return
+        H, W = self.img.shape[:2]                       # keep the box inside the picture
+        a, b, c, d = max(0, a), max(0, b), min(W, c), min(H, d)
+        if c - a < 4 or d - b < 4:
+            self.canvas.delete("sel")
+            return
         self._pending_box = [a, b, c - a, d - b]
         set_button(self.next_btn, enabled=True)
 
@@ -901,7 +907,8 @@ class CalibrationDialog(tk.Toplevel):
                 if sl in self.liq:
                     e = self.edit_store.get(sl)
                     self.liq[sl]["edits"] = e.copy() if e is not None and e.any() and \
-                        e.shape == (self.boxes[sl][3], self.boxes[sl][2]) else None
+                        e.shape == self.img[self.boxes[sl][1]:self.boxes[sl][1] + self.boxes[sl][3],
+                                         self.boxes[sl][0]:self.boxes[sl][0] + self.boxes[sl][2]].shape[:2] else None
             self.result = (self.boxes, self.bars, self.points, self.liq)
             self.destroy()
             return
@@ -1263,6 +1270,7 @@ class TriggerCalibDialog(tk.Toplevel):
 
     def _edits(self):
         x, y, w, h = self.box
+        h, w = self.img[y:y + h, x:x + w].shape[:2]     # the part of the box that's on the picture
         if self.fix.edits is None or self.fix.edits.shape != (h, w):
             e = None
             if self.edits_key and self._old_box == list(self.box):     # same area as last time: keep its fixes
@@ -1355,6 +1363,8 @@ class TriggerCalibDialog(tk.Toplevel):
             self.fix.rect(a - self.box[0], b - self.box[1], c - self.box[0], d - self.box[1])
             self._render()
             return
+        H, W = self.img.shape[:2]                       # keep the box inside the picture
+        a, b, c, d = max(0, a), max(0, b), min(W, c), min(H, d)
         if c - a >= 4 and d - b >= 4:
             self.box = [a, b, c - a, d - b]
             self.points = []
