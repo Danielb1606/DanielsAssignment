@@ -57,7 +57,7 @@ RECENT_ERRORS: "collections.deque[str]" = collections.deque(maxlen=20)   # for "
 def note_error(where: str) -> None:
     """Remember the current exception (with its full traceback) for diagnostics."""
     RECENT_ERRORS.append(f"[{time.strftime('%H:%M:%S')}] {where}\n{traceback.format_exc()}")
-__version__ = "1.7.0"
+__version__ = "1.7.1"
 # Saved next to the .exe when packaged (a one-file .exe unpacks itself to a
 # temporary folder, so __file__ would point somewhere that gets deleted).
 _BASE = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
@@ -1077,6 +1077,7 @@ class FlaskController:
 
     # -- one check -----------------------------------------------------------
     def poll(self) -> None:
+        self._apply_options()
         now = self.clock()
         r = self.read()
         if r is None:
@@ -1194,6 +1195,32 @@ class FlaskController:
                     and now - self.last_globe_press.get(slot, -1e9) >= o["globe_again"]):
                 self.last_globe_press[slot] = now
                 self._schedule(slot, now, f"globe at {rd.globe:.0f}% (below {o['globe_below']:g}%)")
+
+    def update_options(self, kinds: Dict[int, str], refresh_below: Dict[int, float],
+                       slot_opts: Dict[int, dict]) -> None:
+        """Apply changed flask roles/settings while running (no Stop/Start needed).
+        Safe to call from another thread: it's applied at the start of the next check."""
+        self._new_options = (dict(kinds), dict(refresh_below), dict(slot_opts))
+
+    def _apply_options(self) -> None:
+        opts, self._new_options = getattr(self, "_new_options", None), None
+        if not opts:
+            return
+        kinds, refresh_below, slot_opts = opts
+        self.kinds = dict(kinds)
+        self.quick = tuple(sorted(sl for sl, k in self.kinds.items() if k == "quicksilver"))
+        self.instill = tuple(sorted(sl for sl, k in self.kinds.items() if k in ("life", "mana")))
+        self.utility = tuple(sorted(sl for sl, k in self.kinds.items() if k == "utility"))
+        self.refresh_below = dict(refresh_below)
+        self.slot_opts = dict(slot_opts)
+        for sl, k in self.kinds.items():           # a flask that changed role starts fresh
+            if k == "off":
+                self.queued.discard(sl)
+                self.queue = [p for p in self.queue if p.slot != sl]
+                heapq.heapify(self.queue)
+            self.wait_refill.discard(sl)
+            self.failed_slots.discard(sl)
+        self.log("Flask settings updated.")
 
     def _run_triggers(self, now: float) -> None:
         values = self.read_triggers() or {}

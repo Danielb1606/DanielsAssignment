@@ -515,3 +515,14 @@ assert all(b - a >= 2.0 - 0.06 for a, b in zip(p1, p1[1:])), p1    # again only 
 d = [float(l.split("in ")[1].split(" ms")[0]) for l in glog if "slot 1 globe" in l]
 assert d and all(400 <= x <= 450 for x in d), d
 print(f"globe: flask 1 pressed at {p1} (globe 30% < 40%), delays {d} - ok")
+
+# ---- changing a flask's role while running applies straight away ----
+rs3 = RoleSim(); rs3.active3 = False
+rc3 = da.FlaskController(rs3.read, rs3.press, clock=rs3.now, sleep=rs3.sleep, rng=random.Random(9), log=lambda m: None)
+rc3.run(1)
+cfgu = da.default_config(); da.slot_cfg(cfgu, 3)["kind"] = "utility"
+rc3.update_options(**da.controller_options(cfgu))
+n = len(rs3.presses)
+rc3.run(2)
+assert rc3.utility == (3,) and 3 in rs3.presses[n:], rs3.presses
+print("live role change: flask 3 used as utility without restarting - ok")

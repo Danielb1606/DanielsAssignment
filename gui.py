@@ -251,7 +251,7 @@ class FlaskCard(tk.Frame):
     def __init__(self, parent, slot: int, kind: str, on_recal, on_kind=None):
         super().__init__(parent, bg=PANEL, highlightthickness=2, highlightbackground=BORDER)
         self.slot, self.kind = slot, kind
-        title = tk.Label(self, text=f"{slot}  ·  {KIND_LABEL.get(kind, kind)}  ▾", bg=PANEL, fg=GOLD, font=H_FONT,
+        title = tk.Label(self, text=f"{slot}  ·  {KIND_LABEL.get(kind, kind)}  ▼", bg=PANEL, fg=GOLD, font=H_FONT,
                          cursor="hand2")
         title.pack(pady=(8, 4))
         if on_kind:
@@ -2040,6 +2040,14 @@ class App(tk.Tk):
         m.add_command(label=f"Settings for flask {slot}…", command=lambda: self.flask_settings(slot))
         m.tk_popup(x, y)
 
+    def _apply_live(self) -> str:
+        """Push flask changes into the running controller. Returns a note for the log."""
+        c = self.engine.controller
+        if self.engine.mode == "run" and c is not None:
+            c.update_options(**core.controller_options(self.cfg))
+            return " Applied straight away."
+        return ""
+
     def pick_globe(self, slot: int):
         if self.engine.mode != "idle":
             messagebox.showinfo(core.APP, "Stop first, then link the globe.")
@@ -2082,7 +2090,7 @@ class App(tk.Tk):
         except OSError:
             pass
         core.save_config(self.cfg)
-        self.write_log(f"Flask {slot} is no longer linked to a globe.")
+        self.write_log(f"Flask {slot} is no longer linked to a globe." + self._apply_live())
 
     def flask_settings(self, slot: int):
         dlg = FlaskSettingsDialog(self, self.cfg, slot)
@@ -2090,7 +2098,7 @@ class App(tk.Tk):
         if dlg.saved:
             core.save_config(self.cfg)
             self._build_cards()
-            self.write_log(dlg.saved + (" Stop and Start again for it to take effect." if self.engine.mode != "idle" else ""))
+            self.write_log(dlg.saved + self._apply_live())
 
     def set_kind(self, slot: int, kind: str):
         sc = core.slot_cfg(self.cfg, slot)
@@ -2106,9 +2114,7 @@ class App(tk.Tk):
         msg = f"Flask {slot} is now: {core.KIND_NAMES[kind]}."
         if kind in core.BAR_KINDS and sc.get("box"):
             msg += " If its timer strip isn't picked up, press Recalibrate on it."
-        if self.engine.mode != "idle":
-            msg += " Stop and Start again for it to take effect."
-        self.write_log(msg)
+        self.write_log(msg + self._apply_live())
 
     def toggle_test(self):
         if self.engine.mode == "test":
