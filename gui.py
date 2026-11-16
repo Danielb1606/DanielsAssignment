@@ -1303,8 +1303,9 @@ class TriggerCalibDialog(tk.Toplevel):
             share = float(m.mean())
             self.instr.config(text="With the colour fully showing, click it. Pink = what will be watched. Slide "
                               "Similarity until the pink covers it but nothing else." if not self.points else
-                              f"Pink = what will be watched ({share:.0%} of the box). When most of it is gone, "
-                              f"{core.hotkey_label(self.t['key'])} gets pressed.")
+                              f"Pink = what will be watched ({share:.0%} of the box). When most of it is gone, " +
+                              (f"{core.hotkey_label(self.t['key'])} gets pressed." if self.t.get("key")
+                               else "the flask gets pressed (below the % you set in its settings)."))
             set_button(self.undo, enabled=bool(self.points))
             set_button(self.next_btn, text="Finish  ✓", enabled=share >= 0.005)
 
@@ -2385,10 +2386,19 @@ class App(tk.Tk):
         if where:
             msg += f"  ({where.name}, line {where.lineno})"
         self.write_log(msg)
+        # one box per problem: the same error repeating (e.g. while dragging a slider) only shows once a minute
+        now = time.time()
+        if getattr(self, "_err_shown", {}).get(msg, 0) > now - 60 or getattr(self, "_err_open", False):
+            self._update_buttons()
+            return
+        self._err_shown = {**getattr(self, "_err_shown", {}), msg: now}
+        self._err_open = True
         try:
             messagebox.showerror(core.APP, msg + "\n\nPlease send a screenshot of this to get it fixed.")
         except Exception:
             pass
+        finally:
+            self._err_open = False
         self._update_buttons()
 
     # -- triggers ------------------------------------------------------------------
