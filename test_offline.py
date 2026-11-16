@@ -436,3 +436,44 @@ c2.run(3); assert tsim2.keys == ["q"]
 assert not da.validate_trigger(dict(trig)) and da.validate_trigger(dict(trig, fire_below=60))
 print(f"trigger: {len(times)} presses, gaps {min(gaps):.2f}-{max(gaps):.2f}s, stops when blue returns; once-mode ok")
 print("ALL CHECKS PASSED")
+
+# ---- flask roles: slot 3 as a utility flask (used when full and under 10% left) ----
+print("\n=== Flask roles ===")
+cfg = da.default_config()
+da.slot_cfg(cfg, 3)["kind"] = "utility"
+kinds = da.slot_kinds(cfg)
+assert kinds == {1: "life", 2: "mana", 3: "utility", 4: "quicksilver", 5: "quicksilver"}, kinds
+
+class RoleSim:
+    def __init__(s):
+        s.t = 0.0; s.presses = []; s.left = 0.5; s.active3 = True; s.qs_until = {}
+    def now(s): return s.t
+    def sleep(s, d): s.t += d
+    def read(s):
+        out = {}
+        for k in range(1, 6):
+            act = s.active3 if k == 3 else s.t < s.qs_until.get(k, -1)
+            out[k] = da.SlotReading(True, True, act, 1.0, 1.0, None, 1.0, s.left if act else 0.0)
+        return out
+    def press(s, k):
+        s.presses.append(k)
+        if k in (4, 5): s.qs_until[k] = s.t + 4      # quicksilver runs for 4 s
+        return True
+
+rs = RoleSim()
+rc = da.FlaskController(rs.read, rs.press, clock=rs.now, sleep=rs.sleep, rng=random.Random(9), log=lambda m: None,
+                        kinds=kinds, refresh_below={3: 10})
+assert rc.quick == (4, 5) and rc.utility == (3,), (rc.quick, rc.utility)
+rc.run(3)
+assert 3 not in rs.presses, rs.presses          # 50% left: leave it
+assert set(p for p in rs.presses if p >= 3) <= {4, 5}
+rs.left = 0.05
+rc.run(2)
+assert 3 in rs.presses, rs.presses              # under 10% left and full: use it
+cfg2 = da.default_config(); da.slot_cfg(cfg2, 3)["kind"] = "off"
+rs2 = RoleSim(); rs2.active3 = False
+rc2 = da.FlaskController(rs2.read, rs2.press, clock=rs2.now, sleep=rs2.sleep, rng=random.Random(9), log=lambda m: None,
+                         kinds=da.slot_kinds(cfg2))
+rc2.run(4)
+assert 3 not in rs2.presses, rs2.presses        # off: never pressed
+print("roles: utility waits for <10% left, quicksilvers 4/5 only, 'not used' never pressed - ok")

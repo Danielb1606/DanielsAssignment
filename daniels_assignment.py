@@ -57,7 +57,7 @@ RECENT_ERRORS: "collections.deque[str]" = collections.deque(maxlen=20)   # for "
 def note_error(where: str) -> None:
     """Remember the current exception (with its full traceback) for diagnostics."""
     RECENT_ERRORS.append(f"[{time.strftime('%H:%M:%S')}] {where}\n{traceback.format_exc()}")
-__version__ = "1.5.1"
+__version__ = "1.6.0"
 # Saved next to the .exe when packaged (a one-file .exe unpacks itself to a
 # temporary folder, so __file__ would point somewhere that gets deleted).
 _BASE = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
@@ -192,6 +192,27 @@ def validate_settings(st: dict) -> List[str]:
 SLOT_KINDS = {1: "life", 2: "mana", 3: "quicksilver", 4: "quicksilver", 5: "quicksilver"}
 QUICKSILVER_SLOTS = (3, 4, 5)
 INSTILLING_SLOTS = (1, 2)
+# What each flask slot does. Changeable per slot (click the flask's name in the app).
+KIND_NAMES = {"life": "Life", "mana": "Mana", "quicksilver": "Quicksilver",
+              "utility": "Utility", "off": "Not used"}
+BAR_KINDS = ("quicksilver", "utility")      # flasks with a timer strip under them
+
+
+UTILITY_REFRESH_BELOW = 10    # % of the effect left before a utility flask is used again
+
+
+def slot_refresh(cfg: Optional[dict]) -> Dict[int, float]:
+    return {int(sc["slot"]): float(sc.get("refresh_below", UTILITY_REFRESH_BELOW))
+            for sc in (cfg or {}).get("slots", [])}
+
+
+def slot_kinds(cfg: Optional[dict]) -> Dict[int, str]:
+    """{slot: kind} from the config, falling back to the original layout."""
+    kinds = dict(SLOT_KINDS)
+    for sc in (cfg or {}).get("slots", []):
+        if sc.get("kind") in KIND_NAMES:
+            kinds[int(sc["slot"])] = sc["kind"]
+    return kinds
 DEFAULT_BAR_RGB = (249, 215, 153)    # measured from your screenshot
 
 TOP_BAND_FRAC = 0.15  # top 15% of the liquid decides "full"
@@ -459,6 +480,7 @@ class SlotReading:
     top_match: float     # share of the top-of-liquid pixels that still match
     sig: Optional[np.ndarray] = None   # small picture of the liquid area, to spot any change
     brightness: float = 1.0            # frame brightness vs. the calibration picture (pause = dimmer)
+    remaining: float = 0.0             # share of the timer strip still showing (0 = not running, 1 = just used)
 
 
 DEFAULT_SIMILARITY = 55   # calibration slider default (1-100)
@@ -648,9 +670,18 @@ class SlotModel:
         visible = self.shape_match(gray) >= VISIBLE_CORR_MIN
 
         active = False
+        remaining = 0.0
         if bar_crop is not None and bar_crop.size:
             dist = np.abs(bar_crop.astype(int) - np.array(bar_bgr)).max(axis=2)
-            active = int((dist <= BAR_RGB_TOL).sum()) >= BAR_MIN_PIXELS
+            hits = dist <= BAR_RGB_TOL
+            active = int(hits.sum()) >= BAR_MIN_PIXELS
+            if active:
+                # the strip shrinks along its long side as the effect runs out; compare its
+                # length with the longest it has been (a fresh flask fills the strip)
+                along = hits.any(axis=0) if hits.shape[1] >= hits.shape[0] else hits.any(axis=1)
+                length = int(along.sum())
+                self.bar_longest = max(getattr(self, "bar_longest", 0), length)
+                remaining = length / max(1, self.bar_longest)
 
         sig = None
         if self.mask.any():
@@ -661,7 +692,8 @@ class SlotModel:
         brightness = 1.0
         if self.ref_bright > 1 and self.bright_mask.any():
             brightness = float(gray[self.bright_mask].mean()) / self.ref_bright
-        return SlotReading(visible, full and visible, active and visible, fill, top_match, sig, brightness)
+        return SlotReading(visible, full and visible, active and visible, fill, top_match, sig, brightness,
+                           remaining if visible else 0.0)
 
 
 def slot_points(s: dict) -> List[Tuple[int, int]]:
@@ -820,7 +852,7 @@ def auto_detect(img: np.ndarray, cfg: dict) -> Dict[int, dict]:
         d.setdefault("points", [d["point"]] if d.get("point") else [])
         d.setdefault("similarity", DEFAULT_SIMILARITY)
         d.setdefault("mode", "shape")
-        if slot in QUICKSILVER_SLOTS and not d.get("bar_box"):
+        if slot_kinds(cfg).get(slot) in BAR_KINDS and not d.get("bar_box"):
             d["bar_box"] = default_bar_box(d["box"])
         # unsure if the liquid it would pick looks too small
         x, y, w, h = d["box"]
@@ -934,8 +966,15 @@ class FlaskController:
                  settings: Optional[dict] = None,
                  triggers: Optional[List[dict]] = None,
                  read_triggers: Callable[[], Dict[int, Optional[float]]] = lambda: {},
-                 press_key: Optional[Callable[[str], bool]] = None):
+                 press_key: Optional[Callable[[str], bool]] = None,
+                 kinds: Optional[Dict[int, str]] = None,
+                 refresh_below: Optional[Dict[int, float]] = None):
         self.read, self.press = read, press
+        self.kinds = dict(kinds or SLOT_KINDS)
+        self.quick = tuple(sorted(sl for sl, k in self.kinds.items() if k == "quicksilver"))
+        self.instill = tuple(sorted(sl for sl, k in self.kinds.items() if k in ("life", "mana")))
+        self.utility = tuple(sorted(sl for sl, k in self.kinds.items() if k == "utility"))
+        self.refresh_below: Dict[int, float] = dict(refresh_below or {})
         self.triggers = [t for t in (triggers or []) if t.get("enabled", True)]
         self.read_triggers = read_triggers
         self.press_key = press_key or (lambda combo: False)
@@ -1024,7 +1063,7 @@ class FlaskController:
         for slot, deadline in list(self.verify.items()):
             if not r[slot].full or r[slot].active or self._changed(slot, r[slot]):
                 self.verify.pop(slot, None)
-                if slot in QUICKSILVER_SLOTS:
+                if slot in self.quick:
                     self.fails = 0
                     self.failed_slots.clear()
                 self.wait_refill.add(slot)
@@ -1038,13 +1077,13 @@ class FlaskController:
                     if slot == self.probe_slot:
                         self.probe_slot = None
                     continue
-                if slot not in QUICKSILVER_SLOTS:
+                if slot not in self.quick:
                     continue      # life/mana can't be drunk at full life/mana - not a sign of town
                 self.fails += 1
                 self.failed_slots.add(slot)
                 self.log(f"[{now:8.3f}] slot {slot}: press had no effect ({self.fails}/{self.fails_for_town})")
                 # a real town stops every quicksilver, so one misbehaving flask isn't enough
-                usable = sum(1 for q in QUICKSILVER_SLOTS if r[q].visible and r[q].full)
+                usable = sum(1 for q in self.quick if r[q].visible and r[q].full)
                 if self.fails >= self.fails_for_town and len(self.failed_slots) >= min(2, max(1, usable)):
                     self.enter_town("flasks are not being used")
                     break
@@ -1074,7 +1113,7 @@ class FlaskController:
             # every few seconds, quietly try one quicksilver; if it works, town mode ends
             if (self.town_retry > 0 and self.probe_slot is None and now - self.last_probe >= self.town_retry
                     and not self.queue):
-                for slot in sorted(QUICKSILVER_SLOTS, key=lambda q: self.last_press.get(q, -1e9)):
+                for slot in sorted(self.quick, key=lambda q: self.last_press.get(q, -1e9)):
                     if r[slot].visible and r[slot].full and slot not in self.verify:
                         self.probe_slot = slot
                         self.last_probe = now
@@ -1084,12 +1123,19 @@ class FlaskController:
 
         if not self._quicksilver_running(r, now):
             # after a quicksilver didn't respond, try a different one next
-            for slot in sorted(QUICKSILVER_SLOTS, key=lambda q: (q in self.failed_slots, q)):
+            for slot in sorted(self.quick, key=lambda q: (q in self.failed_slots, q)):
                 if r[slot].visible and r[slot].full and self._can_schedule(slot, now):
                     self._schedule(slot, now)
                     break
-        for slot in INSTILLING_SLOTS:
+        for slot in self.instill:
             if r[slot].visible and r[slot].full and self._can_schedule(slot, now):
+                self._schedule(slot, now)
+        # utility flasks: keep each one's effect going on its own (no taking turns)
+        for slot in self.utility:
+            rd = r[slot]
+            low = (not rd.active) or rd.remaining * 100 < self.refresh_below.get(slot, 10)
+            if (rd.visible and rd.full and low and self._can_schedule(slot, now)
+                    and now - self.last_press.get(slot, -1e9) >= ACTIVATION_GRACE + 1.0):
                 self._schedule(slot, now)
 
     def _run_triggers(self, now: float) -> None:
@@ -1124,7 +1170,7 @@ class FlaskController:
         return float(np.abs(rd.sig - before).mean()) > CHANGE_MIN
 
     def _quicksilver_running(self, r: Dict[int, SlotReading], now: float) -> bool:
-        for slot in QUICKSILVER_SLOTS:
+        for slot in self.quick:
             if r[slot].active or slot in self.queued or slot in self.verify:
                 return True
             if now - self.last_press.get(slot, -1e9) < ACTIVATION_GRACE:
@@ -1668,7 +1714,7 @@ def cmd_calibrate(args) -> None:
                                      "(not the label/wings/glass)")
 
     for slot in slots:
-        if slot not in QUICKSILVER_SLOTS:
+        if slot_kinds(cfg).get(slot) not in BAR_KINDS:
             continue
         sc = slot_cfg(cfg, slot)
         old = sc["bar_box"]
@@ -1760,7 +1806,8 @@ def cmd_run(args) -> None:
         raise SystemExit("Set your program's window title first:  calibrate --window \"<title>\"")
     locator = WindowLocator(cfg["window_title"], cfg.get("screen_origin", (0, 0)))
     reader = FlaskReader(cfg, locator, ScreenGrabber())
-    ctl = FlaskController(reader.read, KeySender(cfg, locator), settings=get_settings(cfg))
+    ctl = FlaskController(reader.read, KeySender(cfg, locator), settings=get_settings(cfg), kinds=slot_kinds(cfg),
+                        refresh_below=slot_refresh(cfg))
 
     from pynput import keyboard
 

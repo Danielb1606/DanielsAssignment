@@ -10,7 +10,11 @@ OpenCV/NumPy, mss, pynput, ctypes SendInput. Packaged as a one-file PyInstaller 
 It lives in Dan's Workshop at `apps\Daniels Assignment\` (data in `daniels_assignment_data\` next to the exe).
 
 ## Behaviour (Dan's requirements)
-- Quicksilvers in slots 3-5 rotate one at a time; life/mana (1-2) used when FULL (Instilling Orb style).
+- Each slot has a role (click the flask's name on its card): Life / Mana (use when FULL, Instilling Orb style),
+  Quicksilver (quicksilvers take turns, one running at a time), Utility (use when FULL and its timer strip
+  shows under `refresh_below`% left, default 10, judged against the longest the strip has been), Not used.
+  Stored as `kind` / `refresh_below` per slot in config.json. Dan's current belt: 1 life, 2 mana,
+  3 utility, 4-5 quicksilver. Town mode only counts quicksilver failures.
 - 4 checks/s; random 150-300 ms delay before a press (professor's requirement); key hold random 20-90 ms;
   keys sent as hardware scan codes (SendInput), pynput fallback.
 - Calibration GUI: draw boxes, click the liquid colour, Similarity slider (default 55), shape/box modes,

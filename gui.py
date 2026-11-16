@@ -37,7 +37,7 @@ SMALL = ("Segoe UI", 9)
 PILL_FONT = ("Segoe UI Semibold", 11)
 
 THUMB_W, THUMB_H = 120, 165
-KIND_LABEL = {"life": "Life", "mana": "Mana", "quicksilver": "Quicksilver"}
+KIND_LABEL = core.KIND_NAMES
 
 
 MODIFIER_KEYSYMS = ("Shift_L", "Shift_R", "Control_L", "Control_R", "Alt_L", "Alt_R", "Meta_L", "Meta_R",
@@ -189,7 +189,8 @@ class Engine:
             self.controller = core.FlaskController(
                 lambda: self._read_and_store(reader), sender, log=self.log, settings=settings,
                 triggers=[t for t in cfg.get("triggers", []) if t["id"] in reader.trigger_models],
-                read_triggers=lambda: reader.trigger_values, press_key=sender.press_combo)
+                read_triggers=lambda: reader.trigger_values, press_key=sender.press_combo,
+                kinds=core.slot_kinds(cfg), refresh_below=core.slot_refresh(cfg))
             self.controller.on_town = lambda on: self.log_q.put("__TOWN_ON__" if on else "__TOWN_OFF__")
             target = self._run_loop
             args = ()
@@ -247,10 +248,14 @@ class Engine:
 
 # ================================================================ flask card
 class FlaskCard(tk.Frame):
-    def __init__(self, parent, slot: int, kind: str, on_recal):
+    def __init__(self, parent, slot: int, kind: str, on_recal, on_kind=None):
         super().__init__(parent, bg=PANEL, highlightthickness=2, highlightbackground=BORDER)
         self.slot, self.kind = slot, kind
-        tk.Label(self, text=f"{slot}  ·  {KIND_LABEL[kind]}", bg=PANEL, fg=GOLD, font=H_FONT).pack(pady=(8, 4))
+        title = tk.Label(self, text=f"{slot}  ·  {KIND_LABEL.get(kind, kind)}  ▾", bg=PANEL, fg=GOLD, font=H_FONT,
+                         cursor="hand2")
+        title.pack(pady=(8, 4))
+        if on_kind:
+            title.bind("<Button-1>", lambda e: on_kind(slot, e.x_root, e.y_root))
         # A Label's width/height are in text characters unless it shows an
         # image, so it always shows one: a blank placeholder until calibrated.
         self._blank = tk.PhotoImage(width=THUMB_W, height=THUMB_H)
@@ -261,7 +266,7 @@ class FlaskCard(tk.Frame):
         self.detail = tk.Label(self, text="", bg=PANEL, fg=MUTED, font=SMALL)
         self.detail.pack()
         self.run_pill = None
-        if kind == "quicksilver":
+        if kind in core.BAR_KINDS:
             self.run_pill = tk.Label(self, text="not running", bg=PANEL, fg=MUTED, font=PILL_FONT, pady=3,
                                      highlightthickness=1, highlightbackground=GREY)
             self.run_pill.pack(fill="x", padx=10, pady=(4, 0))
@@ -283,7 +288,8 @@ class FlaskCard(tk.Frame):
         self._photo = to_photo(tile, THUMB_W, THUMB_H)
         self.canvas.config(image=self._photo)
 
-    def set_state(self, label: str, colour: str, detail: str = "", running: Optional[bool] = None) -> None:
+    def set_state(self, label: str, colour: str, detail: str = "", running: Optional[bool] = None,
+                  left: Optional[float] = None) -> None:
         self.pill.config(text=label, bg=colour)
         self.config(highlightbackground=colour if colour != GREY else BORDER)
         self.detail.config(text=detail)
@@ -291,7 +297,8 @@ class FlaskCard(tk.Frame):
             if running is None:
                 self.run_pill.config(text="—", bg=PANEL, fg=MUTED, highlightbackground=GREY)
             elif running:
-                self.run_pill.config(text="RUNNING", bg=YELLOW, fg="#1a140c", highlightbackground=YELLOW)
+                txt = "RUNNING" if left is None else f"RUNNING · {left:.0%} left"
+                self.run_pill.config(text=txt, bg=YELLOW, fg="#1a140c", highlightbackground=YELLOW)
             else:
                 self.run_pill.config(text="not running", bg=PANEL, fg=MUTED, highlightbackground=GREY)
 
@@ -318,7 +325,7 @@ class CalibrationDialog(tk.Toplevel):
         else:
             for s in slots:
                 self.steps += [("box", s), ("liquid", s)]
-        self.steps += [("bar", s) for s in slots if s in core.QUICKSILVER_SLOTS]
+        self.steps += [("bar", s) for s in slots if core.slot_kinds(cfg).get(s) in core.BAR_KINDS]
         self.i = 0
         self.boxes: Dict[int, List[int]] = {}
         self.points: Dict[int, List[Tuple[int, int]]] = {}
@@ -434,7 +441,7 @@ class CalibrationDialog(tk.Toplevel):
     # -- steps ----------------------------------------------------------------
     def _render(self) -> None:
         kind, slot = self.steps[self.i]
-        name = KIND_LABEL[core.SLOT_KINDS[slot]]
+        name = KIND_LABEL[core.slot_kinds(self.cfg)[slot]]
         what = "Flasks 4 and 5 (Quicksilver)" if kind == "find" else f"Flask {slot} ({name})"
         self.step_lbl.config(text=f"Step {self.i + 1} of {len(self.steps)}  ·  {what}")
         set_button(self.back_btn, enabled=self.i > 0)
@@ -526,7 +533,7 @@ class CalibrationDialog(tk.Toplevel):
         self._show_liquid(slot)
 
     def _show_liquid(self, slot):
-        name = KIND_LABEL[core.SLOT_KINDS[slot]].lower()
+        name = KIND_LABEL[core.slot_kinds(self.cfg)[slot]].lower()
         mask = self._liquid(slot)
         self._set_view(tuple(self.boxes[slot]), overlay=mask)
         for px, py in self.points.get(slot, []):
@@ -753,7 +760,7 @@ class ReviewDialog(tk.Toplevel):
         boxes, bars, points, liq = dlg.result
         self.entries[slot] = {"box": boxes[slot], "points": points.get(slot, []),
                               "similarity": liq[slot]["similarity"], "mode": liq[slot]["mode"],
-                              "bar_box": bars.get(slot) if slot in core.QUICKSILVER_SLOTS else None,
+                              "bar_box": bars.get(slot) if core.slot_kinds(self.cfg).get(slot) in core.BAR_KINDS else None,
                               "unsure": False, "source": "you"}
         self._render()
 
@@ -765,7 +772,7 @@ class ReviewDialog(tk.Toplevel):
         if any(self._status(s) == "missing" for s in range(1, 6)):
             return
         boxes = {s: e["box"] for s, e in self.entries.items()}
-        bars = {s: e["bar_box"] for s, e in self.entries.items() if s in core.QUICKSILVER_SLOTS and e.get("bar_box")}
+        bars = {s: e["bar_box"] for s, e in self.entries.items() if core.slot_kinds(self.cfg).get(s) in core.BAR_KINDS and e.get("bar_box")}
         points = {s: e.get("points", []) for s, e in self.entries.items()}
         liq = {s: {"similarity": e["similarity"], "mode": e["mode"]} for s, e in self.entries.items()}
         self.result = (boxes, bars, points, liq)
@@ -1199,7 +1206,7 @@ class SettingsDialog(tk.Toplevel):
         row = tk.Frame(box, bg=PANEL)
         row.pack(anchor="w", pady=(2, 4))
         for slot in "12345":
-            kind = KIND_LABEL[core.SLOT_KINDS[int(slot)]]
+            kind = KIND_LABEL[core.slot_kinds(self.cfg)[int(slot)]]
             col = tk.Frame(row, bg=PANEL)
             col.pack(side="left", padx=(0, 14))
             tk.Label(col, text=f"{slot} · {kind}", bg=PANEL, fg=MUTED, font=SMALL).pack(anchor="w")
@@ -1560,13 +1567,10 @@ class App(tk.Tk):
         self._refresh_windows()
 
         # flask cards
-        cards = tk.Frame(self, bg=BG)
-        cards.pack(padx=22, pady=8)
+        self.cards_frame = tk.Frame(self, bg=BG)
+        self.cards_frame.pack(padx=22, pady=8)
         self.cards: Dict[int, FlaskCard] = {}
-        for i, s in enumerate(self.cfg["slots"]):
-            c = FlaskCard(cards, s["slot"], s["kind"], self.recalibrate)
-            c.grid(row=0, column=i, padx=6, sticky="n")
-            self.cards[s["slot"]] = c
+        self._build_cards()
 
         # triggers
         tf = tk.Frame(self, bg=BG)
@@ -1821,15 +1825,16 @@ class App(tk.Tk):
             card = self.cards[slot]
             if slot in crops:
                 card.show_image(crops[slot])
-            run = rd.active if card.kind == "quicksilver" else None
+            run = rd.active if card.kind in core.BAR_KINDS else None
+            left = rd.remaining if (card.kind == "utility" and rd.active) else None
             if not rd.visible:
-                card.set_state("NOT VISIBLE", ORANGE, "belt hidden / covered", run)
+                card.set_state("NOT VISIBLE", ORANGE, "belt hidden / covered", run, left)
             elif rd.brightness < core.PAUSE_DIM:
-                card.set_state("PAUSED", GREY, "program looks paused (dimmed)", run)
+                card.set_state("PAUSED", GREY, "program looks paused (dimmed)", run, left)
             elif rd.full:
-                card.set_state("FULL", GREEN, f"about {rd.fill:.0%}", run)
+                card.set_state("FULL", GREEN, f"about {rd.fill:.0%}", run, left)
             else:
-                card.set_state("NOT FULL", RED, f"about {rd.fill:.0%}", run)
+                card.set_state("NOT FULL", RED, f"about {rd.fill:.0%}", run, left)
 
     # -- actions ------------------------------------------------------------
     def _capture(self) -> Optional[np.ndarray]:
@@ -1894,6 +1899,60 @@ class App(tk.Tk):
 
     def recalibrate(self, slot: int):
         self.calibrate([slot])
+
+    def _build_cards(self):
+        for w in self.cards_frame.winfo_children():
+            w.destroy()
+        self.cards = {}
+        for i, s in enumerate(self.cfg["slots"]):
+            c = FlaskCard(self.cards_frame, s["slot"], s["kind"], self.recalibrate, self.kind_menu)
+            c.grid(row=0, column=i, padx=6, sticky="n")
+            self.cards[s["slot"]] = c
+
+    def kind_menu(self, slot: int, x: int, y: int):
+        """Click a flask's name: choose what that flask does."""
+        sc = core.slot_cfg(self.cfg, slot)
+        m = tk.Menu(self, tearoff=0, bg=PANEL, fg=TEXT, activebackground=PANEL_2, activeforeground=TEXT, font=FONT)
+        tips = {"life": "use when full", "mana": "use when full", "quicksilver": "take turns, one running at a time",
+                "utility": f"use when full and under {sc.get('refresh_below', core.UTILITY_REFRESH_BELOW):g}% left",
+                "off": "never pressed"}
+        for k, name in core.KIND_NAMES.items():
+            mark = "✓ " if sc["kind"] == k else "   "
+            m.add_command(label=f"{mark}{name}  ({tips[k]})", command=lambda k=k: self.set_kind(slot, k))
+        if sc["kind"] == "utility":
+            m.add_separator()
+            m.add_command(label="Change the 'use again' % …", command=lambda: self.set_refresh(slot))
+        m.tk_popup(x, y)
+
+    def set_kind(self, slot: int, kind: str):
+        sc = core.slot_cfg(self.cfg, slot)
+        if sc["kind"] == kind:
+            return
+        sc["kind"] = kind
+        if kind in core.BAR_KINDS and sc.get("box") and not sc.get("bar_box"):
+            sc["bar_box"] = core.default_bar_box(sc["box"])
+        if kind == "utility":
+            sc.setdefault("refresh_below", core.UTILITY_REFRESH_BELOW)
+        core.save_config(self.cfg)
+        self._build_cards()
+        msg = f"Flask {slot} is now: {core.KIND_NAMES[kind]}."
+        if kind in core.BAR_KINDS and sc.get("box"):
+            msg += " If its timer strip isn't picked up, press Recalibrate on it."
+        if self.engine.mode != "idle":
+            msg += " Stop and Start again for it to take effect."
+        self.write_log(msg)
+
+    def set_refresh(self, slot: int):
+        from tkinter import simpledialog
+        sc = core.slot_cfg(self.cfg, slot)
+        v = simpledialog.askinteger(core.APP, f"Use flask {slot} again when less than this % of its effect is left:",
+                                    initialvalue=int(sc.get("refresh_below", core.UTILITY_REFRESH_BELOW)),
+                                    minvalue=1, maxvalue=100, parent=self)
+        if v:
+            sc["refresh_below"] = v
+            core.save_config(self.cfg)
+            self.write_log(f"Flask {slot} will be used again below {v}% left"
+                           + (" (Stop and Start again for it to take effect)." if self.engine.mode != "idle" else "."))
 
     def toggle_test(self):
         if self.engine.mode == "test":
