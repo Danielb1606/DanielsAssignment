@@ -557,3 +557,27 @@ dec = np.zeros((40, 20), np.uint8)
 sm_fixed = da.SlotModel(ref, [(10, 25)], 55, "box", dec)
 assert (sm_plain.mask == sm_fixed.mask).all()
 print("hand fixes: paint in/out applied, saved and cleared - ok")
+
+# ---- a flask whose effect still has >= 10% left is never used, even when its globe is low ----
+class RunSim(GlobeSim):
+    def __init__(s):
+        super().__init__(); s.left = 0.6; s.active = True
+    def read(s):
+        out = {}
+        for k in range(1, 6):
+            rd = da.SlotReading(True, True, (k == 3 and s.active) or k >= 4, 1.0, 1.0, None, 1.0,
+                                s.left if k == 3 else 0.5)
+            if k == 3: rd.globe = s.globe
+            out[k] = rd
+        return out
+rsim = RunSim(); rsim.globe = 20.0
+cfg = da.default_config(); sc3 = da.slot_cfg(cfg, 3); sc3["kind"] = "utility"
+sc3["globe"] = {"box": [0, 0, 10, 10], "below": 50, "again_ms": 2000}
+rc = da.FlaskController(rsim.read, rsim.press, clock=rsim.now, sleep=rsim.sleep, rng=random.Random(4),
+                        log=lambda m: None, **da.controller_options(cfg))
+rc.run(4)
+assert not any(k == 3 for _, k in rsim.presses), rsim.presses        # 60% left: never pressed, globe or not
+rsim.left = 0.05
+rc.run(2)
+assert any(k == 3 for _, k in rsim.presses), rsim.presses            # under 10% left + globe low: used
+print("running flasks (>=10% left) are never re-used, even with the globe low - ok")

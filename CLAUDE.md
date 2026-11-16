@@ -15,6 +15,9 @@ It lives in Dan's Workshop at `apps\Daniels Assignment\` (data in `daniels_assig
   shows under `refresh_below`% left, default 10, judged against the longest the strip has been), Not used.
   Stored as `kind` / `refresh_below` per slot in config.json. Dan's current belt: 1 life, 2 mana,
   3 utility, 4-5 quicksilver. Town mode only counts quicksilver failures.
+- Hard rule (Dan): a flask whose timer strip still shows >= its `refresh_below`% (default 10%) is NEVER pressed,
+  by any rule (globe link, use-when-full, utility) - `_still_running`; also blocked for ~1.5 s after a press
+  until its strip appears. Only works for flasks with a timer strip box (quicksilver/utility).
 - Per flask (name menu → Settings for flask N…): own press delay range (`delay_min_ms`/`delay_max_ms`,
   else the main 150-300 ms), and an optional globe link (`globe`: box + colour like a trigger, `below` %
   chosen by Dan, `again_ms` repeat while still low, ref image `globeN_reference.png`). A linked flask is

@@ -57,7 +57,7 @@ RECENT_ERRORS: "collections.deque[str]" = collections.deque(maxlen=20)   # for "
 def note_error(where: str) -> None:
     """Remember the current exception (with its full traceback) for diagnostics."""
     RECENT_ERRORS.append(f"[{time.strftime('%H:%M:%S')}] {where}\n{traceback.format_exc()}")
-__version__ = "1.8.6"
+__version__ = "1.8.7"
 # Saved next to the .exe when packaged (a one-file .exe unpacks itself to a
 # temporary folder, so __file__ would point somewhere that gets deleted).
 _BASE = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
@@ -1228,7 +1228,7 @@ class FlaskController:
                     break
         for slot in self.instill:
             rd = r[slot]
-            if rd.visible and rd.full and self._can_schedule(slot, now):
+            if rd.visible and rd.full and self._can_schedule(slot, now) and not self._still_running(slot, rd, now):
                 self._schedule(slot, now)
         # utility flasks: keep each one's effect going on its own (no taking turns)
         for slot in self.utility:
@@ -1243,11 +1243,20 @@ class FlaskController:
                 continue
             rd = r[slot]
             if (rd.visible and rd.globe is not None and rd.globe < o["globe_below"]
+                    and not self._still_running(slot, rd, now)
                     and slot not in self.queued and slot not in self.verify
                     and now - self.last_press.get(slot, -1e9) >= self.cooldown
                     and now - self.last_globe_press.get(slot, -1e9) >= o["globe_again"]):
                 self.last_globe_press[slot] = now
                 self._schedule(slot, now, f"globe at {rd.globe:.0f}% (below {o['globe_below']:g}%)")
+
+    def _still_running(self, slot: int, rd: SlotReading, now: float) -> bool:
+        """A flask whose effect still has at least its 'use again below' % left (10% by
+        default) is never used - pressing it would waste a charge. Also covers the
+        moment right after a press, before its timer strip shows up."""
+        if now - self.last_press.get(slot, -1e9) < ACTIVATION_GRACE + 1.0:
+            return True
+        return bool(rd.active) and rd.remaining * 100 >= self.refresh_below.get(slot, UTILITY_REFRESH_BELOW)
 
     def update_options(self, kinds: Dict[int, str], refresh_below: Dict[int, float],
                        slot_opts: Dict[int, dict]) -> None:
