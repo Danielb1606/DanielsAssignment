@@ -57,7 +57,7 @@ RECENT_ERRORS: "collections.deque[str]" = collections.deque(maxlen=20)   # for "
 def note_error(where: str) -> None:
     """Remember the current exception (with its full traceback) for diagnostics."""
     RECENT_ERRORS.append(f"[{time.strftime('%H:%M:%S')}] {where}\n{traceback.format_exc()}")
-__version__ = "1.8.7"
+__version__ = "1.8.8"
 # Saved next to the .exe when packaged (a one-file .exe unpacks itself to a
 # temporary folder, so __file__ would point somewhere that gets deleted).
 _BASE = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
@@ -1455,6 +1455,113 @@ class HotkeyListener:
         m = self._mod(key)
         if m:
             self.mods.discard(m)
+
+
+class WinHotkeyListener:
+    """Hotkeys through Windows' own hotkey system (RegisterHotKey). Windows only tells
+    us when one of our combinations is pressed, so no other keystroke ever passes
+    through this app (the old keyboard hook saw every key, which could add input lag).
+    Same interface as HotkeyListener."""
+
+    WM_HOTKEY, WM_QUIT, WM_APP = 0x0312, 0x0012, 0x8000
+    MOD = {"alt": 0x0001, "ctrl": 0x0002, "shift": 0x0004}
+    NOREPEAT = 0x4000
+
+    def __init__(self, settings: dict, on_hotkey: Callable[[str], None], on_problem: Callable[[str], None] = lambda m: None):
+        self.on_hotkey, self.on_problem = on_hotkey, on_problem
+        self._paused = False
+        self.thread_id = 0
+        self.thread = None
+        self.ids: Dict[int, str] = {}
+        self.update(settings)
+
+    def update(self, settings: dict) -> None:
+        self.combos = {normalize_hotkey(settings.get(k, "")): k for k in HOTKEY_NAMES}
+        self.combos.pop("", None)
+        self._post(self.WM_APP + 1)                   # re-register in the listener's own thread
+
+    @property
+    def paused(self) -> bool:
+        return self._paused
+
+    @paused.setter
+    def paused(self, value: bool) -> None:
+        # while you record a new hotkey in Settings, let the keys through so the recorder sees them
+        self._paused = bool(value)
+        self._post(self.WM_APP + 1)
+
+    def _post(self, msg: int) -> None:
+        if self.thread_id:
+            import ctypes
+            ctypes.windll.user32.PostThreadMessageW(self.thread_id, msg, 0, 0)
+
+    def start(self) -> bool:
+        if sys.platform != "win32":
+            return False
+        ready = threading.Event()
+        self.thread = threading.Thread(target=self._loop, args=(ready,), daemon=True)
+        self.thread.start()
+        ready.wait(2)
+        return bool(self.thread_id)
+
+    def stop(self) -> None:
+        self._post(self.WM_QUIT)
+        self.thread_id = 0
+
+    def _register(self, u32) -> None:
+        for i in range(1, 10):
+            u32.UnregisterHotKey(None, i)
+        if self._paused:
+            return
+        self.ids = {}
+        failed = []
+        for i, (combo, name) in enumerate(self.combos.items(), start=1):
+            parts = combo.split("+")
+            vk = KeySender.NAME_TO_VK.get(parts[-1])
+            if vk is None:
+                failed.append(combo)
+                continue
+            mods = self.NOREPEAT
+            for m in parts[:-1]:
+                mods |= self.MOD.get(m, 0)
+            if u32.RegisterHotKey(None, i, mods, vk):
+                self.ids[i] = name
+            else:
+                failed.append(combo)
+        if failed:
+            self.on_problem("These hotkeys are already used by another program, so they won't work: "
+                            + ", ".join(hotkey_label(c) for c in failed) + ". Pick others in Settings.")
+
+    def _loop(self, ready) -> None:
+        import ctypes
+        from ctypes import wintypes
+        u32, k32 = ctypes.windll.user32, ctypes.windll.kernel32
+        msg = wintypes.MSG()
+        u32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 0)      # create this thread's message queue
+        self.thread_id = k32.GetCurrentThreadId()
+        self._register(u32)
+        ready.set()
+        while u32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            if msg.message == self.WM_HOTKEY:
+                name = self.ids.get(int(msg.wParam))
+                if name and not self._paused:
+                    self.on_hotkey(name)
+            elif msg.message == self.WM_APP + 1:
+                self._register(u32)
+        for i in range(1, 10):
+            u32.UnregisterHotKey(None, i)
+
+
+def make_hotkey_listener(settings: dict, on_hotkey: Callable[[str], None],
+                         on_problem: Callable[[str], None] = lambda m: None):
+    """Windows' own hotkeys where possible; the keyboard hook only as a fallback."""
+    if sys.platform == "win32":
+        w = WinHotkeyListener(settings, on_hotkey, on_problem)
+        if w.start():
+            return w
+    h = HotkeyListener(settings, on_hotkey)
+    h.start()
+    return h
 
 
 class KeySender:

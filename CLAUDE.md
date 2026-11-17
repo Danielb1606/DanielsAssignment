@@ -47,6 +47,12 @@ It lives in Dan's Workshop at `apps\Daniels Assignment\` (data in `daniels_assig
   so it fills the taskbar slot; larger sizes keep the tile. Dan's rule: the taskbar icon must match the app's
   picture in Dan's Workshop (assets/app_daniels-assignment.png there).
 
+## Performance
+- Hotkeys use Windows RegisterHotKey (WinHotkeyListener, own message-loop thread) - no global keyboard hook,
+  so other keystrokes never pass through the app (the pynput hook could add input lag to the client).
+  Registered keys are taken by the app (the client no longer receives F7/F8/F9). pynput only as fallback.
+- Flask/trigger previews redraw only while the window is visible; ~every 2 s when another program is in front.
+
 ## Working with Dan
 - Before bigger changes, show suggestions/examples to pick between. Small fixes: just do them, mention after.
 - Speed: push and reply without waiting for the build; screenshots only for new screens.

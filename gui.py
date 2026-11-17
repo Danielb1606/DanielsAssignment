@@ -1806,9 +1806,10 @@ class App(tk.Tk):
         self.report_callback_exception = self._ui_error
         self.refresh_cards_idle()
         self.after(250, self._tick)
-        self.hotkeys = core.HotkeyListener(core.get_settings(self.cfg),
-                                           lambda name: self.log_q.put("__HK__" + name))
-        if not self.hotkeys.start():
+        self.hotkeys = core.make_hotkey_listener(core.get_settings(self.cfg),
+                                                 lambda name: self.log_q.put("__HK__" + name),
+                                                 lambda m: self.log_q.put(m))
+        if not (getattr(self.hotkeys, "thread_id", 0) or getattr(self.hotkeys, "listener", None)):
             self.write_log("Hotkeys unavailable on this computer.")
         self._update_hotkey_hint()
         self._update_info = None
@@ -2586,7 +2587,8 @@ class App(tk.Tk):
             self.town_btn.pack_forget()
         elif mode == "test":
             self._set_status("Test mode · nothing is pressed", "#7fb4e6")
-            self._show_live()
+            if self._window_visible():
+                self._show_live()
             if not self.cfg.get("tested") and self.engine.latest:
                 self.cfg["tested"] = True
                 core.save_config(self.cfg)
@@ -2606,7 +2608,8 @@ class App(tk.Tk):
                 self.town_btn.pack_forget()
             if c:
                 set_button(self.pause_btn, text="Resume" if c.paused else "Pause")
-            self._show_live()
+            if self._window_visible():
+                self._show_live()
         if self._resized and mode == "run":
             self._set_status("Window resized · not pressing", ORANGE)
         self._tick_n += 1
@@ -2616,7 +2619,7 @@ class App(tk.Tk):
         elif self.engine.reader is not None and bool(self.engine.reader.size_mismatch) != self._resized:
             self._check_resize()
         self._update_guide()
-        if self.engine.mode in ("test", "run") or getattr(self, "_trig_was_live", False):
+        if (self.engine.mode in ("test", "run") or getattr(self, "_trig_was_live", False)) and self._window_visible():
             self._show_triggers_live()
         self._trig_was_live = self.engine.mode in ("test", "run")
         if self.mini is not None:
@@ -2627,6 +2630,25 @@ class App(tk.Tk):
                      "Window resized · not pressing": "Resized!"}.get(self._status[0], self._status[0])
             self.mini.update_view(r if mode != "idle" else None, short, self._status[1], mode)
         self.after(250, self._tick)
+
+    def _window_visible(self) -> bool:
+        """The flask and trigger previews are only redrawn while you can see this window
+        (not minimised, not hidden behind the compact bar) - saves CPU while you play."""
+        try:
+            if self.state() != "normal" or not self.winfo_viewable():
+                return False
+        except tk.TclError:
+            return False
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                fg = ctypes.windll.user32.GetForegroundWindow()
+                mine = int(self.wm_frame(), 16)
+                if fg != mine and ctypes.windll.user32.GetAncestor(fg, 3) != mine:
+                    return self._tick_n % 8 == 0         # another program is in front: refresh every ~2 s
+            except Exception:
+                pass
+        return True
 
     # -- updates --------------------------------------------------------------
     def _check_update(self, manual: bool = False):
